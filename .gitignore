@@ -1,0 +1,40 @@
+# 数据集（太大，不入库）
+data/
+
+# 模型权重（太大，不入库）
+checkpoints/
+*.pt
+*.pth
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+wandb/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 实验输出（保留结果文件，但排除大型中间产物）
+results/predictions/
+results/intermediate/
+
+# Claude
+.claude/local*
