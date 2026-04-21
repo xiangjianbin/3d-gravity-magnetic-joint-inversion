@@ -1,0 +1,35 @@
+# Full training configuration — extended from smoke.yaml for production runs
+# ======================================================================
+
+model:
+  in_channels: 2
+  base_channels: 64
+  backbone_out_channels: 256
+  aspp_dilation_rates: [6, 12, 18]
+
+data:
+  data_dir: data/
+  batch_size: 4          # Phase 4 will adjust based on actual VRAM measurements
+  num_workers: 2
+  train_split: 0.7
+  val_split: 0.2
+
+training:
+  epochs: 90
+  lr: 1e-3
+  weight_decay: 1e-5
+  use_amp: true
+  gradient_checkpointing: true
+  max_grad_norm: 1.0
+  seed: 42
+  scheduler: cosine
+  scheduler_params:
+    T_max: 90
+    eta_min: 1e-6
+
+output:
+  checkpoint_dir: checkpoints/
+  log_dir: logs/
+  result_dir: results/
+
+device: auto
