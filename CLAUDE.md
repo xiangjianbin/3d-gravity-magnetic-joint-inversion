@@ -8,11 +8,11 @@
 
 ## GPU 环境
 
-- **GPU**: NVIDIA GeForce RTX 3060 Laptop (6GB VRAM)
-- **可用显存**: ~4GB (扣除显示和其他进程占用)
-- **CUDA**: 12.3
-- **驱动**: 546.30
-- **关键约束**: 必须使用混合精度(AMP)、梯度检查点、小 batch_size (1-2)
+- **GPU**: NVIDIA RTX 5000 Ada Generation (32GB VRAM)
+- **可用显存**: ~30GB (当前占用 ~1.3GB)
+- **CUDA**: 12.2
+- **驱动**: 535.230.02
+- **关键约束**: 使用混合精度(AMP)，batch_size 可用 4-8（显存充裕）
 
 ## 项目结构
 
@@ -56,16 +56,18 @@ docs/                # Agent 间文档传递目录
 - 损失: MSE + 多任务加权
 - 评估指标: MSE, RMSE, MAE, Correlation Coefficient
 
-## Pipeline 执行流程
+## Pipeline 执行流程（8 Phase）
 
 本项目采用 **Skill + Task Agent 混合调度** 方式执行:
 
-1. **Phase 0**: 项目初始化 + GitHub 连接
-2. **Phase 1**: 论文解析 → `docs/PAPER_ANALYSIS.md` + `docs/EXPERIMENT_PLAN.md`
-3. **Phase 2**: 数据生成 → `data/` + `docs/DATASET_REPORT.md` + 可视化
-4. **Phase 3**: 模型实现+训练 → `src/` + `checkpoints/` + `docs/TRAINING_LOG.md`
-5. **Phase 4**: 结果对比 → `results/` + `figures/` + 对比报告
-6. **Phase 5**: 审计 → `docs/EXPERIMENT_AUDIT.md` + `docs/FINAL_REPORT.md`
+1. **Phase 0**: 项目初始化 + GitHub 连接 → `REPRODUCTION_STATE.json`
+2. **Phase 1**: 论文深度解析 → `docs/PAPER_ANALYSIS.md` + `docs/ASSUMPTIONS_AND_GAPS.md`
+3. **Phase 2**: 数据集生成+验证+可视化 → `data/` + `docs/DATASET_REPORT.md` + `figures/dataset_*.pdf`
+4. **Phase 3**: 模型架构实现+冒烟测试 → `src/` + `docs/MODEL_REPORT.md` + `docs/SMOKE_TEST_REPORT.md`
+5. **Phase 4**: GPU检查+配置优化 → `docs/GPU_ALLOC_PLAN.md` + `configs/full.yaml`
+6. **Phase 5**: 训练执行+自动修复 → `checkpoints/` + `docs/TRAINING_LOG.md`
+7. **Phase 6**: 结果对齐+图表生成 → `docs/RESULT_COMPARISON.md` + `figures/result_*.pdf`
+8. **Phase 7**: 实验审计+最终报告 → `docs/EXPERIMENT_AUDIT.md` + `docs/FINAL_REPORT.md`
 
 详细方案见: `论文复现项目级技能使用方案.md`
 
@@ -149,7 +151,7 @@ results = {
     "metrics": {...},
     "config": {...},
     "timestamp": "...",
-    "gpu_info": "RTX 3060 6GB"
+    "gpu_info": "RTX 5000 Ada 32GB"
 }
 with open("results/metrics.json", "w") as f:
     json.dump(results, f, indent=2)
@@ -168,7 +170,7 @@ with open("results/metrics.json", "w") as f:
 
 ## 注意事项
 
-1. **显存是第一约束** — RTX 3060 6GB 很紧张，一切以能跑为前提
+1. **显存充裕但不要浪费** — RTX 5000 Ada 32GB，batch_size 可用 4-8，但仍使用 AMP 保持效率
 2. **不追求完全一致** — 复现允许 ±10% 的偏差（随机种子、硬件差异）
 3. **每个 Phase 都 commit** — 保证可回滚
 4. **文档优先** — 先读文档再行动，不要凭记忆

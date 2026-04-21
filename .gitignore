@@ -1,40 +1,59 @@
-# 数据集（太大，不入库）
-data/
-
-# 模型权重（太大，不入库）
-checkpoints/
-*.pt
-*.pth
-*.onnx
-
 # Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
 .env
-.venv/
+.venv
+env/
 venv/
+ENV/
+
+# Data (large files)
+data/*.npy
+data/*.npz
+data/*.h5
+data/*.pt
+data/*.pkl
+data/raw/
+
+# Model checkpoints
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.ckpt
+
+# Logs
+logs/*.log
+wandb/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
-desktop.ini
 
-# 临时文件
-*.tmp
-wandb/
-*.log
-
-# Jupyter
-.ipynb_checkpoints/
-
-# 实验输出（保留结果文件，但排除大型中间产物）
-results/predictions/
-results/intermediate/
-
-# Claude
-.claude/local*
+# Claude Code
+.claude/projects/
