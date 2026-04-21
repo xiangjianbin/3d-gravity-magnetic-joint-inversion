@@ -1,199 +1,149 @@
 """
-完整多任务联合反演网络 — 网络组装
-==================================
+Joint Inversion Network -- Main Model.
 
-将 Backbone U-Net、ASPP、5 个任务头组装为完整的端到端网络。
+Combines the 3D U-Net backbone, ASPP module, and 5 task-specific heads into
+a single end-to-end trainable network for gravity-magnetic joint inversion.
 
-数据流:
-  Input (B, 2, D, H, W)
-    ↓
-  Backbone UNet → (B, 256, D, H, W)
-    ↓
-  ASPP → (B, 256, D, H, W)
-    ├→ Task1 (IndependentGravity)   → rho_pred     (B, 1, D, H, W)
-    ├→ Task2 (IndependentMagnetic)  → kappa_pred   (B, 1, D, H, W)
-    ↓
-  [rho_pred, kappa_pred]
-    ↓
-  Task3 (StructuralSimilarity)      → S            (B, 1, D, H, W), 值域[0,1]
-    ↓
-  [Input, S] → Task4 (JointGravity)       → rho_final    (B, 1, D, H, W)
-  [Input, S] → Task5 (JointMagnetic)      → kappa_final  (B, 1, D, H, W)
+Architecture (paper Fig.1/Fig.2):
+  Input (B, 2, 40, 40, 20)  [gravity_obs, magnetic_obs]
+    -> 3D U-Net Backbone     (feature extraction)
+    -> ASPP                   (multi-scale feature aggregation)
+    -> 5 Task Heads           (task-specific predictions)
 
-训练模式: 返回所有 5 个任务的输出
-推理模式: 只返回 Task 4 + Task 5 的输出
+Outputs:
+  Task 1: Independent gravity density      (B, 1, 40, 40, 20)  MSE
+  Task 2: Independent magnetic suscept.    (B, 1, 40, 40, 20)  MSE
+  Task 3: Structural similarity             (B, 1, 40, 40, 20)  BCE+Sigmoid
+  Task 4: Joint gravity density            (B, 1, 40, 40, 20)  MSE
+  Task 5: Joint magnetic susceptibility    (B, 1, 40, 40, 20)  MSE
+
+Reproduced from:
+  Fang et al., "Improved 3-D Joint Inversion of Gravity and Magnetic Data
+  Based on Deep Learning With a Multitask Learning Strategy",
+  IEEE TGRS, Vol. 63, 2025
 """
 
 import torch
 import torch.nn as nn
 
-from .backbone_unet3d import BackboneUNet3d
-from .aspp import ASPP3d
-from .task_heads import (
-    TaskIndependentGravityHead,
-    TaskIndependentMagneticHead,
-    TaskStructuralSimilarity,
-    TaskJointInversionHead,
-)
+try:
+    from .backbone_unet3d import UNet3DBackbone
+    from .aspp import ASPP3d
+    from .task_heads import TaskHeads
+except ImportError:
+    # Standalone execution: add project root to path and retry
+    import sys, os
+    _proj_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if _proj_root not in sys.path:
+        sys.path.insert(0, _proj_root)
+    from src.model.backbone_unet3d import UNet3DBackbone
+    from src.model.aspp import ASPP3d
+    from src.model.task_heads import TaskHeads
 
 
 class JointInversionNet(nn.Module):
-    """
-    完整的多任务联合反演网络。
+    """Full joint inversion network: backbone + ASPP + 5 task heads.
 
-    组装顺序:
-      Input (B,2,D,H,W)
-        ↓
-      Backbone UNet → (B,256,D,H,W)
-        ↓
-      ASPP → (B,256,D,H,W)
-        ├→ Task1 (IndependentGravity) → rho_pred (B,1,D,H,W)
-        ├→ Task2 (IndependentMagnetic) → kappa_pred (B,1,D,H,W)
-        ↓
-      [rho_pred, kappa_pred]
-        ↓
-      Task3 (StructuralSimilarity) → S (B,1,D,H,W)
-        ↓
-      [Input, S] → Task4 (JointGravity) → rho_final (B,1,D,H,W)
-      [Input, S] → Task5 (JointMagnetic) → kappa_final (B,1,D,H,W)
-
-    Args:
-        in_channels: 输入通道数（重力+磁异常），默认 2
-        aspp_in_channels: ASPP 输入通道数，默认 256（与 backbone 输出一致）
-        aspp_out_channels: ASPP 输出通道数，默认 256
-        leaky_slope: LeakyReLU 负斜率，默认 0.01
-        use_gradient_checkpointing: 是否启用梯度检查点以节省显存
-
-    训练模式 (self.training=True 或 return_all=True):
-        返回包含 5 个任务输出的字典
-
-    推理模式 (self.training=False 且 return_all=False):
-        只返回 Task 4 + Task 5 的最终预测结果
+    The network takes concatenated gravity and magnetic observation data as
+    input and produces five outputs corresponding to independent inversion,
+    structural similarity extraction, and joint inversion tasks.
     """
 
-    def __init__(
-        self,
-        in_channels: int = 2,
-        aspp_in_channels: int = 256,
-        aspp_out_channels: int = 256,
-        leaky_slope: float = 0.01,
-        use_gradient_checkpointing: bool = False,
-    ):
+    def __init__(self,
+                 in_channels: int = 2,
+                 backbone_channels: int = 64,
+                 aspp_out_channels: int = 40,
+                 leaky_slope: float = 0.01) -> None:
+        """
+        Args:
+            in_channels:       Number of input channels (2: gravity + magnetic).
+            backbone_channels: Base channel count for U-Net encoder layer 1.
+            aspp_out_channels: Number of output channels from ASPP (also input
+                               to each task head).
+            leaky_slope:       Negative slope for Leaky-ReLU in task heads.
+        """
         super().__init__()
 
-        self.in_channels = in_channels
-        self.use_gradient_checkpointing = use_gradient_checkpointing
+        # ---- Shared backbone: 3D U-Net feature extractor ----
+        self.backbone = UNet3DBackbone(in_channels=in_channels)
+        # Backbone output: (B, backbone_channels=64, 40, 40, 20)
 
-        # ===== 骨干网络 =====
-        self.backbone = BackboneUNet3d(
-            in_channels=in_channels,
-            out_channels=aspp_in_channels,
-            use_checkpoint=use_gradient_checkpointing,
-        )
-
-        # ===== ASPP 模块 =====
+        # ---- ASPP: multi-scale feature aggregation ----
+        # Input channels = backbone output channels (64 after last decoder layer)
         self.aspp = ASPP3d(
-            in_channels=aspp_in_channels,
+            in_channels=backbone_channels,
             out_channels=aspp_out_channels,
         )
+        # ASPP output: (B, aspp_out_channels=40, 40, 40, 20)
 
-        # ===== 任务头 =====
-        # Task 1: 独立重力反演
-        self.task1 = TaskIndependentGravityHead(
+        # ---- Task-specific heads ----
+        self.task_heads = TaskHeads(
             in_channels=aspp_out_channels,
-            leaky_slope=leaky_slope,
+            negative_slope=leaky_slope,
         )
 
-        # Task 2: 独立磁法反演
-        self.task2 = TaskIndependentMagneticHead(
-            in_channels=aspp_out_channels,
-            leaky_slope=leaky_slope,
-        )
-
-        # Task 3: 结构相似性提取
-        self.task3 = TaskStructuralSimilarity(leaky_slope=leaky_slope)
-
-        # Task 4: 联合重力反演
-        self.task4 = TaskJointInversionHead(leaky_slope=leaky_slope)
-
-        # Task 5: 联合磁法反演
-        self.task5 = TaskJointInversionHead(leaky_slope=leaky_slope)
-
-    def forward(self, x: torch.Tensor, return_all: bool = False) -> dict:
+    def forward(self, x: torch.Tensor) -> dict:
         """
-        前向传播。
+        Forward pass through the complete network.
 
         Args:
-            x: 输入张量 (B, 2, D, H, W)，包含归一化的重力和磁异常数据
-            return_all: 是否返回全部 5 个任务的输出。
-                        True 或训练模式下返回全部；
-                        False 且推理模式下只返回 Task 4/5。
+            x: Input tensor of shape (B, 2, D, H, W) where the 2 channels are
+               [gravity_observation, magnetic_observation].
+               Expected spatial size: (40, 40, 20).
 
         Returns:
-            dict，包含以下键:
-              - 'rho_pred':      Task 1 输出 (B, 1, D, H, W)
-              - 'kappa_pred':    Task 2 输出 (B, 1, D, H, W)
-              - 'structural_sim': Task 3 输出 (B, 1, D, H, W), 值域[0,1]
-              - 'rho_final':     Task 4 输出 (B, 1, D, H, W)
-              - 'kappa_final':   Task 5 输出 (B, 1, D, H, W)
+            Dict with keys 'task1'..'task5', each value is a tensor of shape
+            (B, 1, 40, 40, 20).
         """
-        # === 阶段 1: 特征提取 ===
-        backbone_feat = self.backbone(x)          # (B, 256, D, H, W)
-        aspp_feat = self.aspp(backbone_feat)      # (B, 256, D, H, W)
+        # Shared feature extraction
+        features = self.backbone(x)          # (B, 64, 40, 40, 20)
+        aspp_out = self.aspp(features)       # (B, 40, 40, 40, 20)
 
-        # === 阶段 2: 独立反演 (Task 1 & 2) ===
-        rho_pred = self.task1(aspp_feat)           # (B, 1, D, H, W)
-        kappa_pred = self.task2(aspp_feat)         # (B, 1, D, H, W)
+        # Task-specific predictions
+        outputs = self.task_heads(aspp_out)   # dict of 5 tensors
 
-        # === 阶段 3: 结构相似性提取 (Task 3) ===
-        structural_sim = self.task3(rho_pred, kappa_pred)  # (B, 1, D, H, W), [0,1]
+        return outputs
 
-        # === 阶段 4: 联合反演 (Task 4 & 5) ===
-        rho_final = self.task4(x, structural_sim)           # (B, 1, D, H, W)
-        kappa_final = self.task5(x, structural_sim)         # (B, 1, D, H, W)
+    def get_num_params(self) -> dict:
+        """Return parameter counts for each component."""
+        return {
+            'backbone': sum(p.numel() for p in self.backbone.parameters() if p.requires_grad),
+            'aspp': sum(p.numel() for p in self.aspp.parameters() if p.requires_grad),
+            'task_heads': self.task_heads._num_params(),
+            'total': sum(p.numel() for p in self.parameters() if p.requires_grad),
+        }
 
-        # 根据模式决定返回内容
-        if return_all or self.training:
-            return {
-                'rho_pred': rho_pred,
-                'kappa_pred': kappa_pred,
-                'structural_sim': structural_sim,
-                'rho_final': rho_final,
-                'kappa_final': kappa_final,
-            }
-        else:
-            # 推理模式: 只返回最终预测
-            return {
-                'rho_final': rho_final,
-                'kappa_final': kappa_final,
-            }
 
-    def get_param_summary(self) -> dict:
-        """
-        统计各模块的参数量。
+# ---------------------------------------------------------------------------
+# Quick smoke-test entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        Returns:
-            dict 包含各模块参数量和总参数量
-        """
-        summary = {}
-        total_params = 0
+    model = JointInversionNet(
+        in_channels=2,
+        backbone_channels=64,
+        aspp_out_channels=40,
+        leaky_slope=0.01,
+    ).to(device)
 
-        for name, module in [
-            ('backbone', self.backbone),
-            ('aspp', self.aspp),
-            ('task1_independent_gravity', self.task1),
-            ('task2_independent_magnetic', self.task2),
-            ('task3_structural_similarity', self.task3),
-            ('task4_joint_gravity', self.task4),
-            ('task5_joint_magnetic', self.task5),
-        ]:
-            n_params = sum(p.numel() for p in module.parameters())
-            n_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            summary[name] = {
-                'total': n_params,
-                'trainable': n_trainable,
-            }
-            total_params += n_params
+    params = model.get_num_params()
+    print("Parameter counts:")
+    for k, v in params.items():
+        print(f"  {k}: {v:,}")
 
-        summary['TOTAL'] = {'total': total_params, 'trainable': total_params}
-        return summary
+    # Forward pass test
+    x = torch.randn(2, 2, 40, 40, 20, device=device)
+    with torch.no_grad():
+        outputs = model(x)
+
+    print(f"\nInput shape:  {x.shape}")
+    for key, out in outputs.items():
+        print(f"  {key}: {out.shape}")
+
+    # Verify all output shapes
+    for key, out in outputs.items():
+        assert out.shape == (2, 1, 40, 40, 20), \
+            f"{key} unexpected shape: {out.shape}"
+
+    print("\nJointInversionNet smoke test PASSED.")

@@ -1,152 +1,220 @@
 """
-工具函数 — 随机种子、参数统计、检查点管理、指标追踪
-====================================================
+Utility functions for the gravity-magnetic joint inversion training pipeline.
 
-作者: Agent-MLTestEngineer
-日期: 2026-04-21
+Provides:
+  - Random seed setting (for reproducibility)
+  - Checkpoint save/load
+  - Logging setup
+  - Configuration loading from YAML
 """
 
-import torch
-import numpy as np
-import random
 import os
+import sys
 import json
+import logging
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
 
 
-def set_seed(seed=42):
-    """固定所有随机种子，保证实验可复现性。"""
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int = 42) -> None:
+    """Set random seeds for reproducibility across all libraries.
+
+    Args:
+        seed: Random seed value.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    torch.cuda.manual_seed_all(seed)
+
+    # Ensure deterministic behavior (may impact performance slightly)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-def count_parameters(model):
-    """
-    统计模型参数量。
+# ---------------------------------------------------------------------------
+# Checkpoint management
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(state: dict, filepath: str, is_best: bool = False) -> None:
+    """Save a training checkpoint to disk.
 
     Args:
-        model: nn.Module 实例
+        state:     Dict containing model state_dict, optimizer state_dict,
+                   epoch, best_val_loss, etc.
+        filepath:  Path to save the checkpoint file.
+        is_best:   If True, also save as 'best_model.pth' in the same dir.
+    """
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    torch.save(state, filepath)
+    if is_best:
+        best_path = os.path.join(os.path.dirname(filepath), 'best_model.pth')
+        torch.save(state, best_path)
+
+
+def load_checkpoint(filepath: str, model: torch.nn.Module,
+                    optimizer=None,
+                    device: str = 'cpu') -> dict:
+    """Load a training checkpoint from disk.
+
+    Args:
+        filepath: Path to the checkpoint file.
+        model:    Model to load weights into.
+        optimizer: Optional optimizer to load state into.
+        device:   Device to map tensors to.
 
     Returns:
-        dict: {'total': int, 'trainable': int}
+        The loaded checkpoint dict (with epoch, best_val_loss, etc.).
     """
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return {"total": total, "trainable": trainable}
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"Checkpoint not found: {filepath}")
 
-
-def save_checkpoint(model, optimizer, epoch, loss, path):
-    """
-    保存训练检查点。
-
-    Args:
-        model: 模型实例
-        optimizer: 优化器实例
-        epoch: 当前 epoch 编号
-        loss: 当前验证损失
-        path: 保存路径 (如 checkpoints/best_model.pt)
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
-    torch.save(checkpoint, path)
-
-
-def load_checkpoint(path, model, optimizer=None):
-    """
-    加载训练检查点。
-
-    Args:
-        path: 检查点文件路径
-        model: 模型实例 (将加载权重到此模型)
-        optimizer: 可选，优化器实例 (将恢复优化器状态)
-
-    Returns:
-        dict: 包含 epoch, loss 等信息
-    """
-    checkpoint = torch.load(path, map_location='cpu')
+    checkpoint = torch.load(filepath, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
+
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    info = {
-        'epoch': checkpoint.get('epoch', -1),
-        'loss': checkpoint.get('loss', float('inf')),
-    }
-    return info
+
+    return checkpoint
 
 
-class AverageMeter:
-    """
-    运行平均值追踪器（用于训练/验证过程中的损失和指标追踪）。
-    """
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0.0
-        self.avg = 0.0
-        self.sum = 0.0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count if self.count > 0 else 0.0
-
-
-def compute_metrics(predictions, targets):
-    """
-    计算评估指标: MSE, RMSE, MAE, Pearson Correlation Coefficient。
-
-    分别对密度(rho)和磁化率(kappa)计算。
+def setup_logger(name: str = 'train', log_file=None,
+                 level: int = logging.INFO) -> logging.Logger:
+    """Set up a logger with optional file output.
 
     Args:
-        predictions: dict 含 'rho_final' 和 'kappa_final' (B,1,D,H,W)
-        targets: dict 含 'rho' 和 'kappa' (B,D,H,W) 或 (B,1,D,H,W)
+        name:     Logger name.
+        log_file: Optional path to log file. If None, only console output.
+        level:    Logging level.
 
     Returns:
-        dict: 嵌套字典 {metric_name: {rho: float, kappa: float}}
+        Configured Logger instance.
     """
-    metrics = {}
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger  # Avoid duplicate handlers
 
-    for key in ['rho', 'kappa']:
-        pred_key = f'{key}_final'
-        pred = predictions[pred_key].detach().cpu().flatten()
-        target = targets[key].detach().cpu().flatten()
+    logger.setLevel(level)
 
-        # MSE
-        mse = torch.mean((pred - target) ** 2).item()
+    formatter = logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
-        # RMSE
-        rmse = torch.sqrt(torch.mean((pred - target) ** 2)).item()
+    # Console handler
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(level)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
 
-        # MAE
-        mae = torch.mean(torch.abs(pred - target)).item()
+    # File handler (optional)
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or '.', exist_ok=True)
+        fh = logging.FileHandler(log_file)
+        fh.setLevel(level)
+        fh.setFormatter(formatter)
+        logger.addHandler(fh)
 
-        # Pearson Correlation Coefficient
-        pred_centered = pred - pred.mean()
-        target_centered = target - target.mean()
-        corr_num = torch.sum(pred_centered * target_centered)
-        corr_den = torch.sqrt(
-            torch.sum(pred_centered ** 2) * torch.sum(target_centered ** 2)
-        )
-        correlation = (corr_num / corr_den).item() if corr_den.item() > 1e-8 else 0.0
+    return logger
 
-        metrics[key] = {
-            'MSE': mse,
-            'RMSE': rmse,
-            'MAE': mae,
-            'Correlation': correlation,
-        }
 
-    return metrics
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: str) -> dict:
+    """Load YAML configuration file.
+
+    Args:
+        config_path: Path to .yaml file.
+
+    Returns:
+        Parsed configuration dict.
+    """
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
+
+def save_json(data: dict, filepath: str) -> None:
+    """Save a dictionary as JSON to disk.
+
+    Args:
+        data:     Dictionary to save.
+        filepath: Output path.
+    """
+    os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+    with open(filepath, 'w') as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def load_json(filepath: str) -> dict:
+    """Load JSON file into a dictionary.
+
+    Args:
+        filepath: Path to JSON file.
+
+    Returns:
+        Loaded dictionary.
+    """
+    with open(filepath, 'r') as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# GPU utilities
+# ---------------------------------------------------------------------------
+
+def get_device() -> torch.device:
+    """Get the best available device (CUDA > MPS > CPU)."""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return torch.device('mps')
+    else:
+        return torch.device('cpu')
+
+
+def gpu_memory_summary() -> str:
+    """Return a string summarizing current GPU memory usage."""
+    if not torch.cuda.is_available():
+        return "CUDA not available"
+    total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
+    cached = torch.cuda.memory_reserved(0) / (1024 ** 3)
+    return (
+        f"GPU: {torch.cuda.get_device_name(0)}\n"
+        f"  Total: {total:.1f} GB\n"
+        f"  Allocated: {allocated:.2f} GB\n"
+        f"  Cached: {cached:.2f} GB"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quick test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("=== Utils smoke test ===")
+    set_seed(42)
+    print("Seed set.")
+
+    device = get_device()
+    print(f"Device: {device}")
+    print(gpu_memory_summary())
+
+    logger = setup_logger('test')
+    logger.info("Logger works.")
+    print("\nAll utils tests PASSED.")

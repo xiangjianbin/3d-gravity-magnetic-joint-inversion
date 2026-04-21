@@ -1,35 +1,43 @@
-# Full training configuration — extended from smoke.yaml for production runs
-# ======================================================================
+# Full training configuration for gravity-magnetic joint inversion
+# Based on Fang et al., IEEE TGRS Vol.63, 2025
 
-model:
-  in_channels: 2
-  base_channels: 64
-  backbone_out_channels: 256
-  aspp_dilation_rates: [6, 12, 18]
+# Data
+data_dir: data
+batch_size: 16          # RTX 5000 Ada 32GB can handle larger batches; tune in Phase 4
+num_workers: 4
 
-data:
-  data_dir: data/
-  batch_size: 8          # Optimized: 4.5GB/32GB at bs=8 (GPU_ALLOC_PLAN.md)
-  num_workers: 4
-  train_split: 0.7
-  val_split: 0.2
+# Model architecture
+backbone_channels: 64   # U-Net base filter count
+aspp_out_channels: 40   # ASPP output channels (= task head input channels)
+leaky_slope: 0.01       # Leaky-ReLU negative slope (paper default)
 
-training:
-  epochs: 90
-  lr: 1e-3
-  weight_decay: 1e-5
-  use_amp: true
-  gradient_checkpointing: false  # Not needed: 32GB VRAM, only 4.5GB used at bs=8
-  max_grad_norm: 1.0
-  seed: 42
-  scheduler: cosine
-  scheduler_params:
-    T_max: 90
-    eta_min: 1e-6
+# Training hyperparameters
+seed: 42
+epochs: 90              # ~90 epochs per Fig.5 training curves
+lr: 1e-3                # Initial learning rate (from paper analysis)
+betas: [0.9, 0.999]     # Adam beta1, beta2 (standard defaults)
+weight_decay: 1e-5      # L2 regularization on parameters
 
-output:
-  checkpoint_dir: checkpoints/
-  log_dir: logs/
-  result_dir: results/
+# Learning rate scheduler
+scheduler: cosine       # Options: 'cosine', 'step', 'plateau'
+# For 'step' scheduler:
+step_size: 30
+gamma: 0.1
 
-device: auto
+# Loss function configuration
+task_weights:
+  task1: 1.0            # Independent gravity inversion (MSE)
+  task2: 1.0            # Independent magnetic inversion (MSE)
+  task3: 1.0            # Structural similarity (BCE)
+  task4: 1.0            # Joint gravity inversion (MSE)
+  task5: 1.0            # Joint magnetic inversion (MSE)
+leaky_relu_lambda: 1e-5 # L2 weight penalty coefficient (Leaky-ReLU regularizer)
+
+# Training stability
+grad_clip: 1.0          # Max gradient norm for clipping
+use_amp: true           # Automatic Mixed Precision (saves VRAM on RTX 5000 Ada)
+early_stopping_patience: 15  # Stop if no improvement for N epochs
+
+# Output
+output_dir: results/full_training
+save_every: 10          # Save checkpoint every N epochs

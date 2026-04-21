@@ -1,18 +1,23 @@
-# Core
+# Gravity-Magnetic Joint Inversion - Dependencies
+# Reproducing Fang et al., IEEE TGRS Vol.63, 2025
+
+# Core ML
 torch>=2.0.0
 numpy>=1.24.0
-scipy>=1.10.0
 
-# Data processing
-h5py>=3.8.0
-tqdm>=4.65.0
+# Data / config
+pyyaml>=6.0
 
 # Visualization
 matplotlib>=3.7.0
-seaborn>=0.12.0
+scikit-image>=0.21.0   # for SSIM computation
 
-# Evaluation
-scikit-learn>=1.2.0
+# Progress bar (optional)
+tqdm>=4.65.0
 
-# Utilities
-pyyaml>=6.0
+# Testing
+pytest>=7.0.0
+
+# Jupyter (for notebook training)
+jupyter>=1.0.0
+ipykernel>=6.0.0

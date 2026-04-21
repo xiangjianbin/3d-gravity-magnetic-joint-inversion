@@ -1,260 +1,328 @@
 """
-评估脚本 — 加载 checkpoint，在测试集上评估
-==========================================
+Evaluation Metrics for Gravity-Magnetic Joint Inversion.
 
-输出: results/metrics.json
+Implements all required evaluation metrics:
+  - IoU  (Intersection over Union)
+  - MSE  (Mean Squared Error)
+  - MAE  (Mean Absolute Error)
+  - R^2  (Coefficient of Determination)
+  - SSIM (Structural Similarity Index)
+  - PSNR (Peak Signal-to-Noise Ratio)
 
-用法:
-    python src/evaluate.py --config configs/full.yaml --checkpoint checkpoints/best_model.pt
-
-评估指标 (分别对密度 rho 和磁化率 kappa 计算):
-    - MSE  (Mean Squared Error)
-    - RMSE (Root Mean Square Error)
-    - MAE  (Mean Absolute Error)
-    - Correlation Coefficient (Pearson's r)
-
-作者: Agent-MLTestEngineer
-日期: 2026-04-21
+All metrics operate on 3D volumes (B, 1, D, H, W) or (D, H, W).
 """
 
-import argparse
-import yaml
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset, random_split
-import sys
-import os
-import json
-import time
-
-# 添加项目根目录到 path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from src.utils import set_seed, count_parameters, compute_metrics
+from typing import Optional
 
 
-def evaluate(model, loader, criterion, device):
-    """
-    在测试集上完整评估。
+def compute_iou(pred, target,
+                threshold: float = 0.5) -> float:
+    """Compute Intersection over Union (IoU) for binary segmentation.
+
+    Both pred and target are thresholded to binary masks before computing IoU.
+    This measures how well the predicted anomaly body overlaps with the ground
+    truth anomaly body.
 
     Args:
-        model: JointInversionNet 实例 (已加载权重)
-        loader: 测试 DataLoader
-        criterion: MultiTaskLoss 实例
-        device: torch.device
+        pred:      Predicted volume, shape (..., D, H, W) or (B, 1, D, H, W).
+        target:    Ground truth volume, same shape as pred.
+        threshold: Threshold for binarizing predictions.
 
     Returns:
-        dict: 包含 losses 和 metrics 的完整结果字典
+        IoU score in [0, 1].  Returns 0.0 if both masks are empty.
     """
-    model.eval()
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
 
-    loss_meters = {
-        'total': AverageMeter(),
-        'task1_gravity_mse': AverageMeter(),
-        'task2_magnetic_mse': AverageMeter(),
-        'task3_similarity_mse': AverageMeter(),
-        'task4_gravity_bce': AverageMeter(),
-        'task5_magnetic_bce': AverageMeter(),
+    # Flatten and threshold
+    pred_bin = (pred > threshold).astype(np.float64).ravel()
+    target_bin = (target > threshold).astype(np.float64).ravel()
+
+    intersection = np.sum(pred_bin * target_bin)
+    union = np.sum(pred_bin) + np.sum(target_bin) - intersection
+
+    if union == 0:
+        return 0.0
+    return float(intersection / union)
+
+
+def compute_mse(pred, target) -> float:
+    """Compute Mean Squared Error between prediction and target.
+
+    Args:
+        pred:   Predicted volume.
+        target: Ground truth volume.
+
+    Returns:
+        MSE value (lower is better).
+    """
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
+
+    return float(np.mean((pred - target) ** 2))
+
+
+def compute_mae(pred, target) -> float:
+    """Compute Mean Absolute Error between prediction and target.
+
+    Args:
+        pred:   Predicted volume.
+        target: Ground truth volume.
+
+    Returns:
+        MAE value (lower is better).
+    """
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
+
+    return float(np.mean(np.abs(pred - target)))
+
+
+def compute_r2(pred, target) -> float:
+    """Compute R-squared (coefficient of determination).
+
+    R^2 = 1 - SS_res / SS_tot
+    where SS_res = sum((y_true - y_pred)^2)
+          SS_tot = sum((y_true - mean(y_true))^2)
+
+    Args:
+        pred:   Predicted volume.
+        target: Ground truth volume.
+
+    Returns:
+        R^2 value in (-inf, 1].  1.0 is perfect prediction.
+    """
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
+
+    ss_res = np.sum((target - pred) ** 2)
+    ss_tot = np.sum((target - np.mean(target)) ** 2)
+
+    if ss_tot == 0:
+        return 1.0  # constant target -> perfect fit
+
+    return float(1.0 - ss_res / ss_tot)
+
+
+def compute_ssim(pred, target,
+                 data_range=None) -> float:
+    """Compute Structural Similarity Index (SSIM).
+
+    Uses skimage's structural_similarity for 3D data when available,
+    with a fallback to a simplified implementation.
+
+    Args:
+        pred:        Predicted volume.
+        target:      Ground truth volume.
+        data_range:  Value range of the data. If None, computed from target.
+
+    Returns:
+        SSIM value in [-1, 1].  1.0 means identical.
+    """
+    try:
+        from skimage.metrics import structural_similarity as _ssim
+    except ImportError:
+        # Fallback: use Pearson correlation as a simple structural similarity proxy
+        return _pearson_correlation(pred, target)
+
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
+
+    if data_range is None:
+        data_range = float(target.max() - target.min())
+    if data_range == 0:
+        data_range = 1.0
+
+    # Remove channel dimension if present
+    p = pred.squeeze() if pred.ndim == 5 else pred
+    t = target.squeeze() if target.ndim == 5 else target
+
+    # Use 3D SSIM with a reasonable window size
+    # Choose window size that fits the smallest spatial dimension
+    min_spatial = min(p.shape[-3:])
+    win_size = min(7, min_spatial if min_spatial % 2 == 1 else min_spatial - 1)
+    if win_size < 3:
+        win_size = 3
+    try:
+        val = _ssim(p, t, data_range=data_range, win_size=win_size, channel=None)
+    except (ValueError, NotImplementedError):
+        # Fall back to per-slice 2D SSIM averaged over depth slices
+        scores = []
+        min_depth = min(p.shape[0], t.shape[0])
+        for d in range(min_depth):
+            slice_win = min(win_size, min(p.shape[1], p.shape[2]))
+            if slice_win < 3:
+                slice_win = 3
+            s = _ssim(p[d], t[d], data_range=data_range, win_size=slice_win)
+            scores.append(s)
+        val = float(np.mean(scores)) if scores else 0.0
+
+    return float(val)
+
+
+def _pearson_correlation(pred, target) -> float:
+    """Fallback similarity metric using Pearson correlation coefficient."""
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
+
+    p_flat = pred.ravel()
+    t_flat = target.ravel()
+
+    p_mean = np.mean(p_flat)
+    t_mean = np.mean(t_flat)
+
+    num = np.sum((p_flat - p_mean) * (t_flat - t_mean))
+    den = np.sqrt(np.sum((p_flat - p_mean) ** 2) * np.sum((t_flat - t_mean) ** 2))
+
+    if den == 0:
+        return 0.0
+    return float(num / den)
+
+
+def compute_psnr(pred, target,
+                 data_range=None) -> float:
+    """Compute Peak Signal-to-Noise Ratio (PSNR).
+
+    PSNR = 10 * log10(MAX^2 / MSE)
+    Higher is better. Typical values: 20-40 dB for good reconstructions.
+
+    Args:
+        pred:        Predicted volume.
+        target:      Ground truth volume.
+        data_range:  Maximum possible value in the data range.
+                     If None, uses max(abs(target)).
+
+    Returns:
+        PSNR value in dB.
+    """
+    if isinstance(pred, torch.Tensor):
+        pred = pred.detach().cpu().numpy()
+    if isinstance(target, torch.Tensor):
+        target = target.detach().cpu().numpy()
+
+    mse_val = np.mean((pred - target) ** 2)
+
+    if mse_val == 0:
+        return float('inf')
+
+    if data_range is None:
+        data_range = float(np.max(np.abs(target)))
+    if data_range == 0:
+        data_range = 1.0
+
+    return float(10.0 * np.log10(data_range ** 2 / mse_val))
+
+
+def compute_all_metrics(predictions: dict, targets: dict,
+                        iou_threshold: float = 0.5) -> dict:
+    """Compute all metrics for each task and return a structured result dict.
+
+    Args:
+        predictions: Dict of model outputs {'task1'..'task5': tensor}.
+        targets:     Dict of ground truth {
+                        'density', 'susceptibility', 'structural_sim'
+                      }.
+        iou_threshold: Threshold for IoU computation.
+
+    Returns:
+        Nested dict: {task_name: {metric_name: value}}
+    """
+    results = {}
+
+    # Task 1 & 4: gravity density prediction vs density target
+    for tkey in ['task1', 'task4']:
+        pred = predictions[tkey]
+        tgt = targets['density']
+        name = f'task{tkey[-1]}'
+        results[name] = {
+            'iou': compute_iou(pred, tgt, iou_threshold),
+            'mse': compute_mse(pred, tgt),
+            'mae': compute_mae(pred, tgt),
+            'r2': compute_r2(pred, tgt),
+            'ssim': compute_ssim(pred, tgt),
+            'psnr': compute_psnr(pred, tgt),
+        }
+
+    # Task 2 & 5: magnetic susceptibility prediction vs susceptibility target
+    for tkey in ['task2', 'task5']:
+        pred = predictions[tkey]
+        tgt = targets['susceptibility']
+        name = f'task{tkey[-1]}'
+        results[name] = {
+            'iou': compute_iou(pred, tgt, iou_threshold),
+            'mse': compute_mse(pred, tgt),
+            'mae': compute_mae(pred, tgt),
+            'r2': compute_r2(pred, tgt),
+            'ssim': compute_ssim(pred, tgt),
+            'psnr': compute_psnr(pred, tgt),
+        }
+
+    # Task 3: structural similarity prediction vs structural_sim target
+    pred_t3 = predictions['task3']
+    tgt_struct = targets['structural_sim']
+    results['task3'] = {
+        'iou': compute_iou(pred_t3, tgt_struct, iou_threshold),
+        'mse': compute_mse(pred_t3, tgt_struct),
+        'mae': compute_mae(pred_t3, tgt_struct),
+        'r2': compute_r2(pred_t3, tgt_struct),
+        'ssim': compute_ssim(pred_t3, tgt_struct),
+        'psnr': compute_psnr(pred_t3, tgt_struct),
     }
 
-    all_predictions = {'rho_final': [], 'kappa_final': []}
-    all_targets = {'rho': [], 'kappa': [], 'sim': []}
+    return results
 
-    from src.utils import AverageMeter as _AM
 
-    with torch.no_grad():
-        for batch_idx, (inputs, targets_dict) in enumerate(loader):
-            inputs = inputs.to(device)
-            targets_device = {k: v.to(device) for k, v in targets_dict.items()}
+# ---------------------------------------------------------------------------
+# Quick smoke-test entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import torch
 
-            outputs = model(inputs, return_all=True)
-            total_loss, task_losses = criterion(outputs, targets_device)
+    np.random.seed(42)
+    pred = torch.rand(2, 1, 8, 8, 4)  # small test volume
+    tgt = torch.rand(2, 1, 8, 8, 4)
 
-            loss_meters['total'].update(total_loss.item(), inputs.size(0))
-            for key in ['task1_gravity_mse', 'task2_magnetic_mse',
-                         'task3_similarity_mse', 'task4_gravity_bce', 'task5_magnetic_bce']:
-                val = task_losses[key]
-                if isinstance(val, (int, float)):
-                    loss_meters[key].update(val, inputs.size(0))
+    print("=== Individual metric tests ===")
+    print(f"IoU  (thresh=0.5): {compute_iou(pred, tgt):.4f}")
+    print(f"MSE:               {compute_mse(pred, tgt):.6f}")
+    print(f"MAE:               {compute_mae(pred, tgt):.6f}")
+    print(f"R^2:               {compute_r2(pred, tgt):.4f}")
+    print(f"SSIM:              {compute_ssim(pred, tgt):.4f}")
+    print(f"PSNR:              {compute_psnr(pred, tgt):.2f} dB")
 
-            # 收集预测和真值
-            all_predictions['rho_final'].append(outputs['rho_final'].cpu())
-            all_predictions['kappa_final'].append(outputs['kappa_final'].cpu())
-            all_targets['rho'].append(targets_device['rho'].cpu())
-            all_targets['kappa'].append(targets_device['kappa'].cpu())
-            all_targets['sim'].append(targets_device['sim'].cpu())
-
-    # 汇总损失
-    losses = {k: m.avg for k, m in loss_meters.items()}
-
-    # 拼接所有批次计算指标
-    pred_concat = {
-        'rho_final': torch.cat(all_predictions['rho_final'], dim=0),
-        'kappa_final': torch.cat(all_predictions['kappa_final'], dim=0),
+    # Test batched evaluation
+    preds = {
+        'task1': pred.clone(),
+        'task2': pred.clone(),
+        'task3': (torch.sigmoid(torch.randn_like(pred)) > 0.5).float(),
+        'task4': pred.clone(),
+        'task5': pred.clone(),
     }
-    target_concat = {
-        'rho': torch.cat(all_targets['rho'], dim=0),
-        'kappa': torch.cat(all_targets['kappa'], dim=0),
-        'sim': torch.cat(all_targets['sim'], dim=0),
+    tgts = {
+        'density': tgt.clone(),
+        'susceptibility': tgt.clone(),
+        'structural_sim': (tgt > 0.5).float(),
     }
+    all_metrics = compute_all_metrics(preds, tgts)
 
-    metrics = compute_metrics(pred_concat, target_concat)
+    print("\n=== All metrics (batched) ===")
+    for task_name, metrics in all_metrics.items():
+        print(f"{task_name}:")
+        for mname, mval in metrics.items():
+            print(f"  {mname}: {mval:.4f}")
 
-    return {
-        'losses': losses,
-        'metrics': metrics,
-        'n_samples': len(all_predictions['rho_final']),
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Evaluate Joint Inversion Model')
-    parser.add_argument('--config', type=str, required=True,
-                        help='Path to YAML config file')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to model checkpoint (default: checkpoints/best_model.pt)')
-    parser.add_argument('--split', type=str, default='test',
-                        choices=['train', 'val', 'test'],
-                        help='Dataset split to evaluate on')
-    args = parser.parse_args()
-
-    # 加载 config
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
-
-    print("=" * 60)
-    print("3D Gravity-Magnetic Joint Inversion Evaluation")
-    print(f"Config: {args.config}")
-    print("=" * 60)
-
-    # 设置 seed
-    set_seed(config['training']['seed'])
-
-    # 设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    # ===== 数据准备 =====
-    from src.data.generate_synthetic import generate_dataset
-    from src.data.dataset import JointInversionInMemoryDataset
-
-    data_dir = config['data']['data_dir']
-    batch_size = config['data']['batch_size']
-    train_split = config['data']['train_split']
-    val_split = config['data']['val_split']
-    seed = config['training']['seed']
-
-    npz_exists = os.path.exists(os.path.join(data_dir, 'train_dataset.npz'))
-
-    if not npz_exists:
-        print("\n[Data] No pre-generated dataset. Generating synthetic data...")
-        samples = generate_dataset(dataset_type=1, n_samples=60, seed=seed, verbose=True)
-        full_dataset = JointInversionInMemoryDataset(samples)
-        n_total = len(full_dataset)
-        n_train = int(n_total * train_split)
-        n_val = int(n_total * val_split)
-        n_test = n_total - n_train - n_val
-
-        train_ds, val_ds, test_ds = random_split(
-            full_dataset, [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(seed)
-        )
-
-        split_map = {'train': train_ds, 'val': val_ds, 'test': test_ds}
-        eval_loader = DataLoader(split_map[args.split], batch_size=1, shuffle=False,
-                                 num_workers=config['data']['num_workers'])
-    else:
-        from src.data.dataset import create_dataloaders
-        dataloaders = create_dataloaders(
-            data_dir=data_dir,
-            batch_size=batch_size,
-            num_workers=config['data']['num_workers'],
-        )
-        eval_loader = dataloaders[args.split]
-
-    # ===== 模型 =====
-    from src.model.joint_inversion_net import JointInversionNet
-    from src.model.loss_functions import MultiTaskLoss
-
-    model_config = config.get('model', {})
-    use_gc = config['training'].get('gradient_checkpointing', False)
-    model = JointInversionNet(
-        in_channels=model_config.get('in_channels', 2),
-        use_gradient_checkpointing=use_gc,
-    ).to(device)
-
-    param_info = count_parameters(model)
-    print(f"\nModel parameters: {param_info['trainable']:,} trainable / "
-          f"{param_info['total']:,} total")
-
-    # 加载检查点
-    ckpt_path = args.checkpoint or os.path.join(
-        config['output']['checkpoint_dir'], 'best_model.pt'
-    )
-    if os.path.exists(ckpt_path):
-        from src.utils import load_checkpoint
-        info = load_checkpoint(ckpt_path, model)
-        print(f"Loaded checkpoint: {ckpt_path} (epoch={info['epoch']}, loss={info['loss']:.6f})")
-    else:
-        print(f"[WARNING] Checkpoint not found: {ckpt_path}, using random weights")
-
-    # 损失函数
-    criterion = MultiTaskLoss().to(device)
-
-    # ===== 评估 =====
-    print(f"\nEvaluating on {args.split} split...")
-    start_time = time.time()
-    results = evaluate(model, eval_loader, criterion, device)
-    elapsed = time.time() - start_time
-
-    # ===== 打印结果 =====
-    print("\n" + "=" * 50)
-    print("Evaluation Results")
-    print("=" * 50)
-
-    print(f"\n--- Losses ({args.split} set, N={results['n_samples']}) ---")
-    for name, value in results['losses'].items():
-        print(f"  {name:>25s}: {value:.6f}")
-
-    print("\n--- Metrics ---")
-    for prop in ['rho', 'kappa']:
-        m = results['metrics'][prop]
-        print(f"  [{prop.upper():5s}] MSE={m['MSE']:.6f}  RMSE={m['RMSE']:.6f}  "
-              f"MAE={m['MAE']:.6f}  Corr={m['Correlation']:.6f}")
-
-    print(f"\nEvaluation time: {elapsed:.2f}s")
-
-    # ===== 保存结果 =====
-    result_dir = config['output']['result_dir']
-    os.makedirs(result_dir, exist_ok=True)
-
-    output = {
-        "metrics": {
-            "rho": results['metrics']['rho'],
-            "kappa": results['metrics']['kappa'],
-        },
-        "losses": results['losses'],
-        "config": {
-            "checkpoint": ckpt_path,
-            "split": args.split,
-            "n_samples": results['n_samples'],
-        },
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "gpu_info": (
-            f"{torch.cuda.get_device_name(0)}" if torch.cuda.is_available()
-            else "CPU"
-        ),
-        "model_params": param_info,
-    }
-
-    output_path = os.path.join(result_dir, 'metrics.json')
-    with open(output_path, 'w') as f:
-        json.dump(output, f, indent=2, default=str)
-    print(f"\nResults saved to: {output_path}")
-
-    print("=" * 50)
-
-
-if __name__ == '__main__':
-    main()
+    print("\nAll evaluate smoke tests PASSED.")

@@ -1,31 +1,42 @@
-# Smoke test configuration — minimal training for quick validation
-# ================================================================
+# Smoke test configuration -- quick validation of the full pipeline
+# Small epochs, small batch size, fast iteration
 
-model:
-  in_channels: 2
-  base_channels: 64
-  backbone_out_channels: 256
-  aspp_dilation_rates: [6, 12, 18]
+# Data
+data_dir: data
+batch_size: 2
+num_workers: 0
 
-data:
-  data_dir: data/
-  batch_size: 2
-  num_workers: 0
-  train_split: 0.7
-  val_split: 0.2
+# Model
+backbone_channels: 64
+aspp_out_channels: 40
+leaky_slope: 0.01
 
-training:
-  epochs: 2
-  lr: 1e-3
-  weight_decay: 1e-5
-  use_amp: true
-  gradient_checkpointing: true
-  max_grad_norm: 1.0
-  seed: 42
+# Training
+seed: 42
+epochs: 3
+lr: 1e-3
+betas: [0.9, 0.999]
+weight_decay: 1e-5
 
-output:
-  checkpoint_dir: checkpoints/
-  log_dir: logs/
-  result_dir: results/
+# LR scheduler: 'cosine', 'step', 'plateau', or null
+scheduler: step
+step_size: 2
+gamma: 0.5
 
-device: auto
+# Loss
+task_weights:
+  task1: 1.0
+  task2: 1.0
+  task3: 1.0
+  task4: 1.0
+  task5: 1.0
+leaky_relu_lambda: 1e-5
+
+# Regularization / stability
+grad_clip: 1.0
+use_amp: true
+early_stopping_patience: 100  # disabled for smoke test (won't trigger in 3 epochs)
+
+# Output
+output_dir: results/smoke_test
+save_every: 3

@@ -1,389 +1,379 @@
 """
-3D 重磁联合反演网络训练脚本
-============================
+Training Script for Gravity-Magnetic Joint Inversion Network.
 
-用法:
-    python src/train.py --config configs/smoke.yaml
+Implements the complete training loop:
+  - Adam optimizer (beta1=0.9, beta2=0.999)
+  - Learning rate: initial 1e-3, with StepLR or CosineAnnealingLR
+  - Training loop with validation each epoch
+  - Best model saving based on validation loss
+  - Mixed precision (AMP) support
+  - Gradient clipping
+  - Early stopping
+
+Usage:
     python src/train.py --config configs/full.yaml
+    python src/train.py --config configs/smoke.yaml
 
-关键特性:
-    - AMP (torch.cuda.amp) 混合精度训练
-    - GradScaler 梯度缩放
-    - clip_grad_norm_ 梯度裁剪
-    - 每个 epoch 打印各 task 的 loss
-    - 保存 best 和 final 两个 checkpoint
-
-作者: Agent-MLTestEngineer
-日期: 2026-04-21
+Reproduced from:
+  Fang et al., "Improved 3-D Joint Inversion of Gravity and Magnetic Data
+  Based on Deep Learning With a Multitask Learning Strategy",
+  IEEE TGRS, Vol. 63, 2025
 """
 
-import argparse
-import yaml
-import torch
-from torch.utils.data import DataLoader, Subset, random_split
-import sys
 import os
+import sys
 import time
+import json
+import argparse
 
-# 添加项目根目录到 path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler, autocast
 
+# Add project root to path for imports
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from src.model.joint_inversion_net import JointInversionNet
+from src.model.loss_functions import get_criterion
+from src.data.dataset import create_dataloaders
 from src.utils import (
-    set_seed,
-    count_parameters,
-    save_checkpoint,
-    AverageMeter,
+    set_seed, save_checkpoint, load_config,
+    setup_logger, get_device, gpu_memory_summary, save_json,
 )
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler, epoch):
-    """
-    训练一个 epoch。
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train Joint Inversion Network')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to YAML config file')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='Override output directory from config')
+    return parser.parse_args()
 
-    Args:
-        model: JointInversionNet 实例
-        loader: 训练 DataLoader
-        criterion: MultiTaskLoss 实例
-        optimizer: Adam 优化器
-        device: torch.device
-        scaler: torch.cuda.amp.GradScaler 或 None
-        epoch: 当前 epoch 编号
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device,
+                     scaler=None, grad_clip=1.0):
+    """Run one training epoch.
 
     Returns:
-        dict: 各 task 的平均损失 {'total': float, 'task1': ..., ...}
+        Dict of average per-task losses over the epoch.
     """
     model.train()
+    task_loss_sums = {f'task{i}': 0.0 for i in range(1, 6)}
+    task_loss_counts = {f'task{i}': 0 for i in range(1, 6)}
+    total_loss_sum = 0.0
+    num_batches = 0
 
-    # 初始化各 task 的 AverageMeter
-    loss_meters = {
-        'total': AverageMeter(),
-        'task1_gravity_mse': AverageMeter(),
-        'task2_magnetic_mse': AverageMeter(),
-        'task3_similarity_mse': AverageMeter(),
-        'task4_gravity_bce': AverageMeter(),
-        'task5_magnetic_bce': AverageMeter(),
-    }
+    for batch_idx, batch in enumerate(train_loader):
+        # Move data to device
+        inputs = batch['input'].to(device)
+        targets = {
+            'density': batch['density'].unsqueeze(1).to(device),
+            'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
+            'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
+        }
 
-    for batch_idx, (inputs, targets_dict) in enumerate(loader):
-        inputs = inputs.to(device)
-        # 将 targets 移动到 device (targets 是 dict of tensors)
-        targets_device = {k: v.to(device) for k, v in targets_dict.items()}
+        # Forward pass with optional mixed precision
+        optimizer.zero_grad()
 
-        optimizer.zero_grad(set_to_none=True)
-
-        if scaler is not None and device.type == 'cuda':
-            with torch.amp.autocast('cuda'):
-                outputs = model(inputs, return_all=True)
-                total_loss, task_losses = criterion(outputs, targets_device)
-
+        if scaler is not None:
+            with autocast(enabled=True):
+                predictions = model(inputs)
+                per_task, total_loss = criterion(predictions, targets, model=model)
+            # Scale loss for AMP
             scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(inputs, return_all=True)
-            total_loss, task_losses = criterion(outputs, targets_device)
+            predictions = model(inputs)
+            per_task, total_loss = criterion(predictions, targets, model=model)
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
 
-        # 更新 meters
-        loss_meters['total'].update(total_loss.item(), inputs.size(0))
-        for key in ['task1_gravity_mse', 'task2_magnetic_mse',
-                     'task3_similarity_mse', 'task4_gravity_bce', 'task5_magnetic_bce']:
-            val = task_losses[key]
-            if isinstance(val, (int, float)):
-                loss_meters[key].update(val, inputs.size(0))
+        # Accumulate losses
+        for i in range(1, 6):
+            key = f'task{i}'
+            task_loss_sums[key] += per_task[key].item() if isinstance(per_task[key], torch.Tensor) else per_task[key]
+            task_loss_counts[key] += 1
+        total_loss_sum += total_loss.item()
+        num_batches += 1
 
-    # 返回各 task 平均值
-    return {k: m.avg for k, m in loss_meters.items()}
+    # Compute averages
+    avg_losses = {f'task{i}': task_loss_sums[f'task{i}'] / max(task_loss_counts[f'task{i}'], 1)
+                   for i in range(1, 6)}
+    avg_losses['total'] = total_loss_sum / max(num_batches, 1)
+
+    return avg_losses
 
 
-def validate(model, loader, criterion, device):
-    """
-    验证一个 epoch。
-
-    Args:
-        model: JointInversionNet 实例
-        loader: 验证 DataLoader
-        criterion: MultiTaskLoss 实例
-        device: torch.device
+@torch.no_grad()
+def validate(model, val_loader, criterion, device):
+    """Run one validation epoch.
 
     Returns:
-        tuple: (losses_dict, metrics_dict)
-               losses_dict: 各 task 平均损失
-               metrics_dict: MSE/RMSE/MAE/Correlation 指标
+        Dict of average per-task losses over the validation set.
     """
-    from src.utils import compute_metrics
-
     model.eval()
+    task_loss_sums = {f'task{i}': 0.0 for i in range(1, 6)}
+    task_loss_counts = {f'task{i}': 0 for i in range(1, 6)}
+    total_loss_sum = 0.0
+    num_batches = 0
 
-    loss_meters = {
-        'total': AverageMeter(),
-        'task1_gravity_mse': AverageMeter(),
-        'task2_magnetic_mse': AverageMeter(),
-        'task3_similarity_mse': AverageMeter(),
-        'task4_gravity_bce': AverageMeter(),
-        'task5_magnetic_bce': AverageMeter(),
-    }
+    for batch in val_loader:
+        inputs = batch['input'].to(device)
+        targets = {
+            'density': batch['density'].unsqueeze(1).to(device),
+            'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
+            'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
+        }
 
-    all_predictions = {'rho_final': [], 'kappa_final': []}
-    all_targets = {'rho': [], 'kappa': [], 'sim': []}
+        predictions = model(inputs)
+        per_task, total_loss = criterion(predictions, targets, model=None)
 
-    with torch.no_grad():
-        for inputs, targets_dict in loader:
-            inputs = inputs.to(device)
-            targets_device = {k: v.to(device) for k, v in targets_dict.items()}
+        for i in range(1, 6):
+            key = f'task{i}'
+            task_loss_sums[key] += per_task[key].item() if isinstance(per_task[key], torch.Tensor) else per_task[key]
+            task_loss_counts[key] += 1
+        total_loss_sum += total_loss.item()
+        num_batches += 1
 
-            outputs = model(inputs, return_all=True)
-            total_loss, task_losses = criterion(outputs, targets_device)
+    avg_losses = {f'task{i}': task_loss_sums[f'task{i}'] / max(task_loss_counts[f'task{i}'], 1)
+                   for i in range(1, 6)}
+    avg_losses['total'] = total_loss_sum / max(num_batches, 1)
 
-            loss_meters['total'].update(total_loss.item(), inputs.size(0))
-            for key in ['task1_gravity_mse', 'task2_magnetic_mse',
-                         'task3_similarity_mse', 'task4_gravity_bce', 'task5_magnetic_bce']:
-                val = task_losses[key]
-                if isinstance(val, (int, float)):
-                    loss_meters[key].update(val, inputs.size(0))
-
-            # 收集预测和真值用于指标计算
-            all_predictions['rho_final'].append(outputs['rho_final'])
-            all_predictions['kappa_final'].append(outputs['kappa_final'])
-            all_targets['rho'].append(targets_device['rho'])
-            all_targets['kappa'].append(targets_device['kappa'])
-            all_targets['sim'].append(targets_device['sim'])
-
-    losses = {k: m.avg for k, m in loss_meters.items()}
-
-    # 计算评估指标
-    pred_concat = {
-        'rho_final': torch.cat(all_predictions['rho_final'], dim=0),
-        'kappa_final': torch.cat(all_predictions['kappa_final'], dim=0),
-    }
-    target_concat = {
-        'rho': torch.cat(all_targets['rho'], dim=0),
-        'kappa': torch.cat(all_targets['kappa'], dim=0),
-        'sim': torch.cat(all_targets['sim'], dim=0),
-    }
-    metrics = compute_metrics(pred_concat, target_concat)
-
-    return losses, metrics
+    return avg_losses
 
 
 def main():
-    parser = argparse.ArgumentParser(description='3D Gravity-Magnetic Joint Inversion Training')
-    parser.add_argument('--config', type=str, required=True, help='Path to YAML config file')
-    args = parser.parse_args()
+    args = parse_args()
+    cfg = load_config(args.config)
 
-    # 加载 config
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    # ---- Setup output directory ----
+    output_dir = args.output_dir or cfg.get('output_dir', 'results')
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'checkpoints'), exist_ok=True)
 
-    print("=" * 60)
-    print("3D Gravity-Magnetic Joint Inversion Training")
-    print(f"Config: {args.config}")
-    print("=" * 60)
+    # ---- Logging ----
+    log_file = os.path.join(output_dir, 'training.log')
+    logger = setup_logger('train', log_file=log_file)
+    logger.info("=" * 60)
+    logger.info("Gravity-Magnetic Joint Inversion Training")
+    logger.info("=" * 60)
+    logger.info(f"Config: {args.config}")
+    logger.info(f"Output dir: {output_dir}")
 
-    # 设置 seed
-    seed = config['training']['seed']
+    # ---- Reproducibility ----
+    seed = cfg.get('seed', 42)
     set_seed(seed)
-    print(f"Random seed: {seed}")
+    logger.info(f"Random seed: {seed}")
 
-    # 设备
-    device_str = config.get('device', 'auto')
-    if device_str == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(device_str)
-    print(f"Using device: {device}")
+    # ---- Device ----
+    device = get_device()
+    logger.info(f"Device: {device}")
     if device.type == 'cuda':
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA version: {torch.version.cuda}")
+        logger.info(gpu_memory_summary())
 
-    # ===== 数据准备 =====
-    from src.data.generate_synthetic import generate_dataset
-    from src.data.dataset import JointInversionInMemoryDataset
+    # ---- Data loaders ----
+    data_dir = cfg.get('data_dir', 'data')
+    batch_size = cfg.get('batch_size', 8)
+    num_workers = cfg.get('num_workers', 4)
 
-    data_dir = config['data']['data_dir']
-    batch_size = config['data']['batch_size']
-    train_split = config['data']['train_split']
-    val_split = config['data']['val_split']
+    logger.info(f"Loading dataset from: {data_dir}")
+    logger.info(f"Batch size: {batch_size}, Workers: {num_workers}")
 
-    # 如果数据集文件不存在，先生成小规模数据
-    npz_exists = os.path.exists(os.path.join(data_dir, 'train_dataset.npz'))
+    train_loader, val_loader, test_loader = create_dataloaders(
+        data_dir=data_dir,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=(device.type == 'cuda'),
+    )
+    logger.info(f"Train samples: {len(train_loader.dataset)}")
+    logger.info(f"Val samples:   {len(val_loader.dataset)}")
+    logger.info(f"Test samples:  {len(test_loader.dataset)}")
 
-    if not npz_exists:
-        print("\n[Data] No pre-generated dataset found. Generating small synthetic dataset...")
-        samples = generate_dataset(dataset_type=1, n_samples=60, seed=seed, verbose=True)
-        print(f"[Data] Generated {len(samples)} samples")
-
-        # 创建内存数据集并划分
-        full_dataset = JointInversionInMemoryDataset(samples)
-        n_total = len(full_dataset)
-        n_train = int(n_total * train_split)
-        n_val = int(n_total * val_split)
-        n_test = n_total - n_train - n_val
-
-        train_ds, val_ds, test_ds = random_split(
-            full_dataset, [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(seed)
-        )
-        print(f"[Data] Split: train={n_train}, val={n_val}, test={n_test}")
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=config['data']['num_workers'],
-                                  drop_last=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
-                               num_workers=config['data']['num_workers'])
-        test_loader = DataLoader(test_ds, batch_size=1, shuffle=False,
-                                 num_workers=config['data']['num_workers'])
-    else:
-        from src.data.dataset import create_dataloaders
-        dataloaders = create_dataloaders(
-            data_dir=data_dir,
-            batch_size=batch_size,
-            num_workers=config['data']['num_workers'],
-        )
-        train_loader = dataloaders['train']
-        val_loader = dataloaders['val']
-        test_loader = dataloaders['test']
-
-    # ===== 模型 =====
-    from src.model.joint_inversion_net import JointInversionNet
-
-    model_config = config.get('model', {})
-    use_gc = config['training'].get('gradient_checkpointing', False)
+    # ---- Model ----
     model = JointInversionNet(
-        in_channels=model_config.get('in_channels', 2),
-        use_gradient_checkpointing=use_gc,
+        in_channels=2,
+        backbone_channels=cfg.get('backbone_channels', 64),
+        aspp_out_channels=cfg.get('aspp_out_channels', 40),
+        leaky_slope=cfg.get('leaky_slope', 0.01),
     ).to(device)
 
-    param_info = count_parameters(model)
-    print(f"\nModel parameters: {param_info['trainable']:,} trainable / "
-          f"{param_info['total']:,} total")
+    param_info = model.get_num_params()
+    logger.info(f"Model parameters:")
+    for k, v in param_info.items():
+        logger.info(f"  {k}: {v:,}")
 
-    # ===== 损失函数 =====
-    from src.model.loss_functions import MultiTaskLoss
-    criterion = MultiTaskLoss().to(device)
-
-    # ===== 优化器 =====
-    lr = config['training']['lr']
-    weight_decay = config['training'].get('weight_decay', 0)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=lr, weight_decay=weight_decay
+    # ---- Loss function ----
+    criterion = get_criterion(
+        task_weights=cfg.get('task_weights'),
+        leaky_relu_lambda=cfg.get('leaky_relu_lambda', 1e-5),
     )
 
-    # 学习率调度器 (full.yaml 有 scheduler 配置时使用)
-    scheduler = None
-    if 'scheduler' in config['training']:
-        sched_type = config['training']['scheduler']
-        sched_params = config['training'].get('scheduler_params', {})
-        if sched_type == 'cosine':
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, **sched_params
-            )
-        elif sched_type == 'step':
-            scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, **sched_params
-            )
-        if scheduler is not None:
-            print(f"LR Scheduler: {sched_type} ({sched_params})")
+    # ---- Optimizer ----
+    lr = cfg.get('lr', 1e-3)
+    betas = cfg.get('betas', [0.9, 0.999])
+    weight_decay = cfg.get('weight_decay', 1e-5)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=lr,
+        betas=tuple(betas),
+        weight_decay=weight_decay,
+    )
+    logger.info(f"Optimizer: Adam lr={lr}, betas={betas}, weight_decay={weight_decay}")
 
-    # ===== AMP =====
-    use_amp = config['training'].get('use_amp', True) and device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-    print(f"AMP enabled: {use_amp}")
+    # ---- LR scheduler ----
+    scheduler_name = cfg.get('scheduler', 'cosine')
+    epochs = cfg.get('epochs', 90)
+    if scheduler_name == 'step':
+        step_size = cfg.get('step_size', 30)
+        gamma = cfg.get('gamma', 0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=gamma
+        )
+        logger.info(f"Scheduler: StepLR(step={step_size}, gamma={gamma})")
+    elif scheduler_name == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-6
+        )
+        logger.info(f"Scheduler: CosineAnnealingLR(T_max={epochs})")
+    elif scheduler_name == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10
+        )
+        logger.info("Scheduler: ReduceLROnPlateau(factor=0.5, patience=10)")
+    else:
+        scheduler = None
+        logger.info("No LR scheduler.")
 
-    # ===== 输出目录 =====
-    ckpt_dir = config['output']['checkpoint_dir']
-    result_dir = config['output']['result_dir']
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(result_dir, exist_ok=True)
+    # ---- AMP ----
+    use_amp = cfg.get('use_amp', True) and device.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    logger.info(f"Mixed precision (AMP): {'enabled' if use_amp else 'disabled'}")
 
-    # ===== 训练循环 =====
-    epochs = config['training']['epochs']
-    best_loss = float('inf')
-    best_epoch = 0
-    history = []
+    # ---- Gradient clipping ----
+    grad_clip = cfg.get('grad_clip', 1.0)
 
-    print(f"\n{'Epoch':>6} | {'Train Loss':>12} | {'Val Loss':>10} | "
-          f"T1(MSE):>10 | T2(MSE):>10 | T3(Sim):>9 | T4(BCE):>9 | T5(BCE):>9 | LR")
-    print("-" * 110)
+    # ---- Resume from checkpoint ----
+    start_epoch = 0
+    best_val_loss = float('inf')
+    if args.resume:
+        ckpt = load_checkpoint(args.resume, model, optimizer, device=str(device))
+        start_epoch = ckpt.get('epoch', 0) + 1
+        best_val_loss = ckpt.get('best_val_loss', float('inf'))
+        logger.info(f"Resumed from epoch {start_epoch-1}, best_val_loss={best_val_loss:.6f}")
 
-    start_time = time.time()
+    # ---- Training loop ----
+    early_stopping_patience = cfg.get('early_stopping_patience', 15)
+    epochs_no_improve = 0
+    history = {'train': [], 'val': []}
 
-    for epoch in range(epochs):
+    logger.info(f"\nStarting training for {epochs} epochs...")
+    logger.info("-" * 60)
+
+    total_start_time = time.time()
+
+    for epoch in range(start_epoch, epochs):
         epoch_start = time.time()
 
         # Train
         train_losses = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, epoch
+            model, train_loader, criterion, optimizer, device,
+            scaler=scaler, grad_clip=grad_clip,
         )
 
         # Validate
-        val_losses, val_metrics = validate(
-            model, val_loader, criterion, device
-        )
+        val_losses = validate(model, val_loader, criterion, device)
 
-        # LR step
-        current_lr = optimizer.param_groups[0]['lr']
+        # Update scheduler
         if scheduler is not None:
-            scheduler.step()
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_losses['total'])
+            else:
+                scheduler.step()
 
+        current_lr = optimizer.param_groups[0]['lr']
         epoch_time = time.time() - epoch_start
 
-        # 打印
-        print(f"{epoch+1:>6} | {train_losses['total']:>12.6f} | "
-              f"{val_losses['total']:>10.6f} | "
-              f"{train_losses['task1_gravity_mse']:>10.6f} | "
-              f"{train_losses['task2_magnetic_mse']:>10.6f} | "
-              f"{train_losses['task3_similarity_mse']:>9.6f} | "
-              f"{train_losses['task4_gravity_bce']:>9.6f} | "
-              f"{train_losses['task5_magnetic_bce']:>9.6f} | "
-              f"{current_lr:.2e} ({epoch_time:.1f}s)")
+        # Log
+        history['train'].append(train_losses)
+        history['val'].append(val_losses)
 
-        # 记录历史
-        history.append({
-            'epoch': epoch + 1,
-            'train_loss': train_losses['total'],
-            'val_loss': val_losses['total'],
-            'lr': current_lr,
-            **{f'train_{k}': v for k, v in train_losses.items()},
-            **{f'val_{k}': v for k, v in val_losses.items()},
-        })
+        task_names = ['Task1(IndGrav)', 'Task2(IndMag)', 'Task3(StructSim)',
+                      'Task4(JointGrav)', 'Task5(JointMag)']
 
-        # 保存最佳模型
-        if val_losses['total'] < best_loss:
-            best_loss = val_losses['total']
-            best_epoch = epoch + 1
-            save_checkpoint(
-                model, optimizer, epoch, best_loss,
-                os.path.join(ckpt_dir, 'best_model.pt')
-            )
+        log_msg = (f"Epoch [{epoch+1}/{epochs}] | "
+                   f"Time: {epoch_time:.1f}s | LR: {current_lr:.2e}\n"
+                   f"  Train Loss: Total={train_losses['total']:.6f}" +
+                   "".join([f", T{i+1}={train_losses[f'task{i+1}']:.4f}"
+                             for i in range(5)]) + "\n" +
+                   f"  Val   Loss: Total={val_losses['total']:.6f}" +
+                   "".join([f", T{i+1}={val_losses[f'task{i+1}']:.4f}"
+                             for i in range(5)]))
 
-    total_time = time.time() - start_time
+        logger.info(log_msg)
 
-    # 保存最终模型
-    final_loss = val_losses['total']
-    save_checkpoint(
-        model, optimizer, epochs - 1, final_loss,
-        os.path.join(ckpt_dir, 'final_model.pt')
-    )
+        # Save best model based on total validation loss
+        is_best = val_losses['total'] < best_val_loss
+        if is_best:
+            best_val_loss = val_losses['total']
+            epochs_no_improve = 0
+            logger.info(f"  ** New best val loss: {best_val_loss:.6f} **")
+        else:
+            epochs_no_improve += 1
 
-    print("\n" + "=" * 60)
-    print("Training complete!")
-    print(f"Total time: {total_time:.1f}s ({total_time/60:.1f}min)")
-    print(f"Best validation loss: {best_loss:.6f} at epoch {best_epoch}")
-    print(f"Final validation loss: {final_loss:.6f}")
-    print(f"Checkpoints saved to: {ckpt_dir}/")
-    print("=" * 60)
+        # Save checkpoint every N epochs or when best
+        save_every = cfg.get('save_every', 10)
+        if is_best or (epoch + 1) % save_every == 0:
+            ckpt_path = os.path.join(output_dir, 'checkpoints',
+                                     f'checkpoint_epoch{epoch+1:03d}.pth')
+            save_checkpoint({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'best_val_loss': best_val_loss,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'config': cfg,
+            }, ckpt_path, is_best=is_best)
 
-    # 保存训练历史
-    history_path = os.path.join(result_dir, 'training_history.json')
-    with open(history_path, 'w') as f:
-        json.dump(history, f, indent=2)
-    print(f"Training history saved to: {history_path}")
+        # Early stopping
+        if epochs_no_improve >= early_stopping_patience:
+            logger.info(f"\nEarly stopping triggered after {epochs_no_improve} epochs "
+                       f"without improvement.")
+            break
+
+    total_time = time.time() - total_start_time
+    logger.info(f"\nTraining completed in {total_time/3600:.2f} hours ({total_time:.0f}s)")
+    logger.info(f"Best validation loss: {best_val_loss:.6f}")
+
+    # ---- Save training history ----
+    history_path = os.path.join(output_dir, 'training_history.json')
+    save_json(history, history_path)
+    logger.info(f"Training history saved to {history_path}")
+
+    # ---- Final evaluation on test set ----
+    logger.info("\nRunning final test evaluation...")
+    test_losses = validate(model, test_loader, criterion, device)
+    logger.info(f"Test Loss: Total={test_losses['total']:.6f}" +
+                "".join([f", T{i+1}={test_losses[f'task{i+1}']:.4f}" for i in range(5)]))
+
+    # Save test results
+    test_results_path = os.path.join(output_dir, 'test_results.json')
+    save_json({'test_losses': test_losses, 'best_val_loss': best_val_loss},
+              test_results_path)
+
+    logger.info("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
