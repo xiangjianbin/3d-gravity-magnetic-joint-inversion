@@ -1,0 +1,39 @@
+2026-04-22 06:40:30 | INFO     | ============================================================
+2026-04-22 06:40:30 | INFO     | Gravity-Magnetic Joint Inversion Training
+2026-04-22 06:40:30 | INFO     | ============================================================
+2026-04-22 06:40:30 | INFO     | Config: configs/full.yaml
+2026-04-22 06:40:30 | INFO     | Output dir: results/full_training
+2026-04-22 06:40:30 | INFO     | Random seed: 42
+2026-04-22 06:40:30 | INFO     | Device: cuda
+2026-04-22 06:40:30 | INFO     | GPU: NVIDIA RTX 5000 Ada Generation
+  Total: 31.6 GB
+  Allocated: 0.00 GB
+  Cached: 0.00 GB
+2026-04-22 06:40:30 | INFO     | Loading dataset from: data
+2026-04-22 06:40:30 | INFO     | Batch size: 16, Workers: 4
+2026-04-22 06:40:30 | INFO     | Train samples: 31499
+2026-04-22 06:40:30 | INFO     | Val samples:   9000
+2026-04-22 06:40:30 | INFO     | Test samples:  4501
+2026-04-22 06:40:30 | INFO     | Model parameters:
+2026-04-22 06:40:30 | INFO     |   backbone: 7,859,072
+2026-04-22 06:40:30 | INFO     |   aspp: 79,200
+2026-04-22 06:40:30 | INFO     |   task_heads: 208,485
+2026-04-22 06:40:30 | INFO     |   total: 8,146,757
+2026-04-22 06:40:31 | INFO     | Optimizer: Adam lr=0.001, betas=[0.9, 0.999], weight_decay=1e-05
+2026-04-22 06:40:31 | INFO     | Scheduler: CosineAnnealingLR(T_max=90)
+2026-04-22 06:40:31 | INFO     | Mixed precision (AMP): enabled
+2026-04-22 06:40:31 | INFO     | 
+Starting training for 90 epochs...
+2026-04-22 06:40:31 | INFO     | ------------------------------------------------------------
+src/train.py:259: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler(enabled=use_amp)
+src/train.py:85: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(enabled=True):
+2026-04-22 06:43:13 | INFO     | Epoch [1/90] | Time: 162.1s | LR: 1.00e-03
+  Train Loss: Total=0.139597, T1=0.0020, T2=0.0018, T3=0.1087, T4=0.0023, T5=0.0017
+  Val   Loss: Total=0.094384, T1=0.0017, T2=0.0014, T3=0.0881, T4=0.0019, T5=0.0014
+2026-04-22 06:43:13 | INFO     |   ** New best val loss: 0.094384 **
+2026-04-22 06:45:54 | INFO     | Epoch [2/90] | Time: 160.6s | LR: 9.99e-04
+  Train Loss: Total=0.096425, T1=0.0018, T2=0.0014, T3=0.0837, T4=0.0018, T5=0.0014
+  Val   Loss: Total=0.086818, T1=0.0017, T2=0.0014, T3=0.0806, T4=0.0017, T5=0.0014
+2026-04-22 06:45:54 | INFO     |   ** New best val loss: 0.086818 **
