@@ -1,8 +1,8 @@
 """
-Tests for 3D U-Net Backbone module.
+Tests for 2D U-Net Backbone module.
 
 Validates:
-  - Forward pass shape correctness
+  - Forward pass shape correctness (2D input 81x81 -> 2D output 40x40)
   - Parameter count sanity
   - Gradient flow
 """
@@ -18,49 +18,47 @@ if PROJECT_ROOT not in sys.path:
 
 import torch
 
-from src.model.backbone_unet3d import UNet3DBackbone
+from src.model.backbone_unet3d import UNet2DBackbone
 
 
-class TestUNet3DBackbone:
-    """Test suite for UNet3DBackbone."""
+class TestUNet2DBackbone:
+    """Test suite for UNet2DBackbone."""
 
     def test_forward_shape(self):
-        """Output shape should be (B, 64, 40, 40, 20) for standard input."""
+        """Output shape should be (B, 64, 40, 40) for standard 81x81 input."""
         device = torch.device("cpu")
-        model = UNet3DBackbone(in_channels=2)
-        x = torch.randn(2, 2, 40, 40, 20)
+        model = UNet2DBackbone(in_channels=2)
+        x = torch.randn(2, 2, 81, 81)
         out = model(x)
-        assert out.shape == (2, 64, 40, 40, 20), \
-            f"Expected (2,64,40,40,20), got {out.shape}"
+        assert out.shape == (2, 64, 40, 40), \
+            f"Expected (2,64,40,40), got {out.shape}"
 
     def test_forward_shape_batch1(self):
         """Should work with batch size 1."""
-        model = UNet3DBackbone(in_channels=2)
-        x = torch.randn(1, 2, 40, 40, 20)
+        model = UNet2DBackbone(in_channels=2)
+        x = torch.randn(1, 2, 81, 81)
         out = model(x)
-        assert out.shape == (1, 64, 40, 40, 20)
+        assert out.shape == (1, 64, 40, 40)
 
     def test_parameter_count(self):
-        """Parameter count should be in a reasonable range for this architecture."""
-        model = UNet3DBackbone(in_channels=2)
+        """Parameter count should be in a reasonable range."""
+        model = UNet2DBackbone(in_channels=2)
         n_params = model._num_params()
-        # Expected ~37M based on paper analysis; allow wide range
-        assert 10_000_000 < n_params < 100_000_000, \
+        # 2D U-Net should be ~7.8M params; allow wide range
+        assert 1_000_000 < n_params < 50_000_000, \
             f"Parameter count {n_params:,} seems abnormal"
 
     def test_gradient_flow(self):
         """Gradients should propagate through the network."""
-        model = UNet3DBackbone(in_channels=2)
-        x = torch.randn(2, 2, 40, 40, 20, requires_grad=True)
+        model = UNet2DBackbone(in_channels=2)
+        x = torch.randn(2, 2, 81, 81, requires_grad=True)
         out = model(x)
         loss = out.sum()
         loss.backward()
 
-        # Check that input has gradients
         assert x.grad is not None, "Input gradient is None"
         assert not torch.isnan(x.grad).any(), "NaN in input gradients"
 
-        # Check that all parameters have gradients
         for name, param in model.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for {name}"
@@ -68,16 +66,16 @@ class TestUNet3DBackbone:
 
     def test_different_input_channels(self):
         """Should work with different number of input channels."""
-        model = UNet3DBackbone(in_channels=4)
-        x = torch.randn(2, 4, 40, 40, 20)
+        model = UNet2DBackbone(in_channels=4)
+        x = torch.randn(2, 4, 81, 81)
         out = model(x)
-        assert out.shape == (2, 64, 40, 40, 20)
+        assert out.shape == (2, 64, 40, 40)
 
     def test_deterministic_output(self):
         """Same input should produce same output (no randomness in forward)."""
-        model = UNet3DBackbone(in_channels=2)
+        model = UNet2DBackbone(in_channels=2)
         model.eval()
-        x = torch.randn(2, 2, 40, 40, 20)
+        x = torch.randn(2, 2, 81, 81)
 
         with torch.no_grad():
             out1 = model(x)

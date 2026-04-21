@@ -1,10 +1,10 @@
 """
-Tests for Task Heads and Joint Inversion Network.
+Tests for Task Heads and Joint Inversion Network (2D version).
 
 Validates:
-  - TaskHead forward pass shapes (with/without sigmoid)
+  - TaskHead forward pass shapes (2D input -> 3D output via expansion)
   - TaskHeads container: all 5 heads produce correct output
-  - JointInversionNet end-to-end forward pass
+  - JointInversionNet end-to-end forward pass (2D obs -> 3D pred)
   - Full pipeline: backbone -> ASPP -> task heads dimension chain
   - Loss function computation
 """
@@ -29,24 +29,24 @@ class TestTaskHead:
     """Test suite for individual TaskHead."""
 
     def test_regression_head_shape(self):
-        """Regression head output should be (B, 1, D, H, W)."""
-        head = TaskHead(in_channels=40, use_sigmoid=False)
-        x = torch.randn(2, 40, 8, 8, 4)
+        """Regression head: 2D (B,40,H,W) -> 3D (B,1,D,H,W)."""
+        head = TaskHead(in_channels=40, out_depth=10, use_sigmoid=False)
+        x = torch.randn(2, 40, 8, 8)
         out = head(x)
-        assert out.shape == (2, 1, 8, 8, 4)
+        assert out.shape == (2, 1, 8, 8, 10)
 
     def test_classification_head_range(self):
         """Classification head with sigmoid should output in [0, 1]."""
-        head = TaskHead(in_channels=40, use_sigmoid=True)
-        x = torch.randn(2, 40, 8, 8, 4)
+        head = TaskHead(in_channels=40, out_depth=5, use_sigmoid=True)
+        x = torch.randn(2, 40, 8, 8)
         out = head(x)
         assert out.min() >= 0.0, f"Min={out.min()}"
         assert out.max() <= 1.0, f"Max={out.max()}"
 
     def test_gradient_flow(self):
         """Gradients should flow through head."""
-        head = TaskHead(in_channels=40, use_sigmoid=False)
-        x = torch.randn(2, 40, 8, 8, 4, requires_grad=True)
+        head = TaskHead(in_channels=40, out_depth=6, use_sigmoid=False)
+        x = torch.randn(2, 40, 8, 8, requires_grad=True)
         out = head(x)
         loss = out.sum()
         loss.backward()
@@ -58,8 +58,8 @@ class TestTaskHeads:
 
     def test_all_heads_output_shapes(self):
         """All 5 heads should produce (B, 1, D, H, W)."""
-        heads = TaskHeads(in_channels=40)
-        x = torch.randn(2, 40, 10, 10, 5)
+        heads = TaskHeads(in_channels=40, out_depth=5)
+        x = torch.randn(2, 40, 10, 10)
         outputs = heads(x)
 
         expected_keys = {'task1', 'task2', 'task3', 'task4', 'task5'}
@@ -72,8 +72,8 @@ class TestTaskHeads:
 
     def test_task3_sigmoid_range(self):
         """Task 3 (structural similarity) should be in [0, 1]."""
-        heads = TaskHeads(in_channels=40)
-        x = torch.randn(2, 40, 10, 10, 5)
+        heads = TaskHeads(in_channels=40, out_depth=5)
+        x = torch.randn(2, 40, 10, 10)
         outputs = heads(x)
 
         t3 = outputs['task3']
@@ -88,13 +88,13 @@ class TestTaskHeads:
 
 
 class TestJointInversionNet:
-    """Test suite for the full JointInversionNet."""
+    """Test suite for the full JointInversionNet (2D->3D)."""
 
     def test_end_to_end_shape(self):
-        """Full network: (B,2,40,40,20) -> 5x(B,1,40,40,20)."""
+        """Full network: (B,2,81,81) -> 5x(B,1,20,40,40)."""
         device = torch.device("cpu")
         model = JointInversionNet()
-        x = torch.randn(2, 2, 40, 40, 20)
+        x = torch.randn(2, 2, 81, 81)
         outputs = model(x)
 
         for key in ['task1', 'task2', 'task3', 'task4', 'task5']:
@@ -105,7 +105,7 @@ class TestJointInversionNet:
     def test_task3_sigmoid_in_full_net(self):
         """Task 3 output from full net should be in [0, 1]."""
         model = JointInversionNet()
-        x = torch.randn(2, 2, 40, 40, 20)
+        x = torch.randn(2, 2, 81, 81)
         outputs = model(x)
 
         t3 = outputs['task3']
@@ -115,10 +115,9 @@ class TestJointInversionNet:
     def test_full_network_gradients(self):
         """Gradients should flow through entire network."""
         model = JointInversionNet()
-        x = torch.randn(2, 2, 40, 40, 20)
+        x = torch.randn(2, 2, 81, 81)
         outputs = model(x)
 
-        # Sum all outputs to create scalar loss
         total = sum(o.sum() for o in outputs.values())
         total.backward()
 
@@ -206,7 +205,7 @@ class TestLossFunctions:
         model = JointInversionNet()
         criterion = JointInversionLoss(leaky_relu_lambda=0.0)
 
-        x = torch.randn(2, 2, 40, 40, 20)
+        x = torch.randn(2, 2, 81, 81)
         preds = model(x)
         targets = {
             'density': torch.rand(2, 1, 40, 40, 20),
@@ -217,7 +216,6 @@ class TestLossFunctions:
         _, total_loss = criterion(preds, targets, model=model)
         total_loss.backward()
 
-        # Verify at least some parameter has non-zero gradient
         has_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                        for p in model.parameters() if p.requires_grad)
         assert has_grad, "No non-zero gradients found after backward"
