@@ -1,243 +1,158 @@
 """
-3D 磁法正演计算模块
-===================
+3D Prism Magnetic Anomaly Forward Modeling — PyTorch CUDA (Batched)
 
-基于总场异常 (Total Field Anomaly, ΔT) 公式，实现 3D 磁化率模型的磁法正演。
-
-物理原理:
-    在感应磁化假设下，磁性体被地磁场磁化产生的异常磁场。
-    总场异常 ΔT 是异常磁场在地磁场方向上的投影。
-
-核心公式（感应磁化模型）:
-    ΔT = κ * F * K_m
-
-    其中 K_m 为磁法核函数（重力位二阶导数张量的方向缩并），
-    考虑了地磁场方向 (I, D) 和几何衰减。
-
-单位制:
-    - 输入: 磁化率 SI, 地磁场 F(nT)
-    - 输出: 总场异常 ΔT(nT)
-
-参考文献:
-    1. Blakely, R.J., 1995. Potential Theory in Gravity and Magnetic Applications.
-    2. Li & Oldenburg, 1996. 3-D inversion of magnetic data.
+Based on Bhattacharyya (1964). Units: Susceptibility SI, Output nT
 """
 
 import numpy as np
+import torch
+
+MU_0 = 4.0 * np.pi * 1e-7
+CUDA_OK = torch.cuda.is_available()
+DEVICE = torch.device('cuda' if CUDA_OK else 'cpu')
 
 
-def _magnetic_kernel_on_points(x0, y0, z0, x1, x2, y1, y2, z1, z2,
-                               alpha1, alpha2, alpha3):
+def _magnetic_kernel_cuda(obs_x_2d, obs_y_2d, cell_x1, cell_x2,
+                            cell_y1, cell_y2, cell_z1, cell_z2,
+                            Mx, My, Mz, Fx, Fy, Fz):
     """
-    计算单个棱柱体在一组观测点上的磁法核函数值。
-
-    磁法核函数 = 重力位二阶导数张量的方向缩并:
-        K_m = l²·V_xx + m²·V_yy + n²·V_zz +
-              2lm·V_xy + 2ln·V_xz + 2mn·V_yz
-
-    Parameters
-    ----------
-    x0, y0 : ndarray, shape (N,)
-        观测点 x, y 坐标（1D）。
-    z0 : float
-        观测面高度（标量）。
-    x1..z2 : float
-        棱柱体范围 (m)。
-    alpha1, alpha2, alpha3 : float
-        地磁场方向余弦 (l, m, n)。
-
-    Returns
-    -------
-    kernel : ndarray, shape (N,)
-        磁法核函数值。
+    Compute magnetic contribution of one batch of cells at all observation points.
+    Returns (C, N) coefficient array (multiply by kappa * prefactor for nT).
     """
-    # 确保 1D
-    x0 = np.asarray(x0, dtype=np.float64).ravel()
-    y0 = np.asarray(y0, dtype=np.float64).ravel()
+    C = len(cell_x1)
 
-    # 8 个角点坐标差值 — 形状均为 (2, 2, 2, N)
-    xi = np.array([x1, x2], dtype=np.float64)
-    yj = np.array([y1, y2], dtype=np.float64)
-    zk = np.array([z1, z2], dtype=np.float64)
+    X1 = cell_x1.unsqueeze(1) - obs_x_2d.unsqueeze(0)
+    X2 = cell_x2.unsqueeze(1) - obs_x_2d.unsqueeze(0)
+    Y1 = cell_y1.unsqueeze(1) - obs_y_2d.unsqueeze(0)
+    Y2 = cell_y2.unsqueeze(1) - obs_y_2d.unsqueeze(0)
+    Z1 = cell_z1.unsqueeze(1)
+    Z2 = cell_z2.unsqueeze(1)
 
-    dx = xi[:, np.newaxis, np.newaxis, np.newaxis] - x0   # (2, 1, 1, N)
-    dy = yj[np.newaxis, :, np.newaxis, np.newaxis] - y0   # (1, 2, 1, N)
-    dz = zk[np.newaxis, np.newaxis, :, np.newaxis] - z0   # (1, 1, 2, 1)
+    ax=Mx*Fx; ay=My*Fy; az=Mz*Fz
+    bxy=My*Fx+Mx*Fy; bxz=Mz*Fx+Mx*Fz; byz=Mz*Fy+My*Fz
 
-    r = np.sqrt(dx**2 + dy**2 + dz**2 + 1e-30)
+    total = torch.zeros(C, len(obs_x_2d), dtype=torch.float64, device=obs_x_2d.device)
 
-    # 符号因子
-    signs = np.array([
-        [[+1, -1],
-         [-1, +1]],
-        [[-1, +1],
-         [+1, -1]]
-    ], dtype=np.float64)
-    signs_expanded = signs[..., np.newaxis]  # (2, 2, 2, 1)
+    corners = [(0,0,0),(0,0,1),(0,1,0),(0,1,1),
+               (1,0,0),(1,0,1),(1,1,0),(1,1,1)]
+    for (i,j,k) in corners:
+        mu = 1.0 if (i+j+k)%2==0 else -1.0
+        xi = X1 if i==0 else X2
+        yj = Y1 if j==0 else Y2
+        zk = Z1 if k==0 else Z2
 
-    # === 6 个独立张量分量（Blakely 1995, Eq. 12.10a-f）===
-    with np.errstate(divide='ignore', invalid='ignore'):
-        Vxx_raw = -np.arctan2(dy * dz, dx * r + 1e-30)
-        Vyy_raw = -np.arctan2(dx * dz, dy * r + 1e-30)
-        Vzz_raw = -np.arctan2(dx * dy, dz * r + 1e-30)
+        R = torch.sqrt(xi*xi + yj*yj + zk*zk); R = torch.clamp(R, min=1e-15)
 
-    Vxy_raw = np.log(np.abs(r - dz) + 1e-30)
-    Vxz_raw = np.log(np.abs(dy) + r)
-    Vyz_raw = np.log(np.abs(dx) + r)
+        a1 = torch.where(torch.abs(xi*R)>1e-30, torch.atan2(yj*zk, xi*R), torch.zeros_like(R))
+        a2 = torch.where(torch.abs(yj*R)>1e-30, torch.atan2(xi*zk, yj*R), torch.zeros_like(R))
+        a3 = torch.where(torch.abs(zk*R)>1e-30, torch.atan2(xi*yj, zk*R), torch.zeros_like(R))
 
-    # 对 8 角点求和 -> (N,)
-    Vxx = np.sum(signs_expanded * Vxx_raw, axis=(0, 1, 2))
-    Vyy = np.sum(signs_expanded * Vyy_raw, axis=(0, 1, 2))
-    Vzz = np.sum(signs_expanded * Vzz_raw, axis=(0, 1, 2))
-    Vxy = np.sum(signs_expanded * Vxy_raw, axis=(0, 1, 2))
-    Vxz = np.sum(signs_expanded * Vxz_raw, axis=(0, 1, 2))
-    Vyz = np.sum(signs_expanded * Vyz_raw, axis=(0, 1, 2))
+        l1 = torch.where(R+yj>1e-30, torch.log(torch.abs(R+yj)), torch.zeros_like(R))
+        l2 = torch.where(R+zk>1e-30, torch.log(torch.abs(R+zk)), torch.zeros_like(R))
+        l3 = torch.where(R+xi>1e-30, torch.log(torch.abs(R+xi)), torch.zeros_like(R))
 
-    # 缩并: K_m = a^T · V · a
-    l, m, n_val = alpha1, alpha2, alpha3
-    kernel = (l**2 * Vxx + m**2 * Vyy + n_val**2 * Vzz +
-              2*l*m * Vxy + 2*l*n_val * Vxz + 2*m*n_val * Vyz)
+        total += mu * (ax*a1 + ay*a2 + az*a3 - bxy*l1 - bxz*l2 - byz*l3)
 
-    return kernel
+    return total  # (C, N)
 
 
-def forward_magnetic(kappa_model, grid_params, mag_params=None):
-    """
-    3D 磁法正演：从磁化率模型计算地表总场异常 ΔT。
+def compute_magnetic_anomaly(suscept_model, obs_x, obs_y, obs_z,
+                             dx=20.0, dy=20.0, dz=20.0,
+                             x0=0.0, y0=0.0, z0=0.0,
+                             F_intensity=55000.0, F_declination=-7.0,
+                             F_inclination=60.0):
+    """Magnetic forward — auto CUDA/CPU with batching."""
+    nx,ny,nz=suscept_model.shape; n_obs_x,n_obs_y=len(obs_x),len(obs_y)
 
-    采用感应磁化假设：磁性体的磁化强度由地磁场感应产生，
-    磁化方向与地磁场方向相同。
+    dec_rad=np.radians(F_declination); inc_rad=np.radians(F_inclination)
+    Fx=np.cos(inc_rad)*np.cos(dec_rad); Fy=np.cos(inc_rad)*np.sin(dec_rad); Fz=np.sin(inc_rad)
+    Mx,My,Mz=Fx,Fy,Fz
+    prefactor=F_intensity/(4.0*np.pi)
 
-    Parameters
-    ----------
-    kappa_model : ndarray, shape (nx, ny, nz)
-        3D 磁化率模型，SI 单位。
-    grid_params : dict
-        网格参数:
-        - dx, dy, dz : float — 网格间距 (m)
-        - x0, y0 : float — 坐标原点 (m)，默认 0
-        - z0 : float — 观测面高度 (m)，默认 0
-    mag_params : dict or None
-        地磁参数:
-        - I : float — 磁倾角 (度)，默认 45°
-        - D : float — 磁偏角 (度)，默认 0°
-        - F : float — 地磁场总强度 (nT)，默认 50000
+    xb=x0+np.arange(nx+1)*dx; yb=y0+np.arange(ny+1)*dy; zb=z0+np.arange(nz+1)*dz
+    nonzero=np.argwhere(suscept_model!=0); n_nz=len(nonzero)
+    if n_nz==0: return np.zeros((n_obs_x,n_obs_y),dtype=np.float64)
 
-    Returns
-    -------
-    magnetic_anomaly : ndarray, shape (nx, ny)
-        总场异常 ΔT (nT)。
-    """
-    # ===== 默认地磁参数（Gap 7: 中国中纬度典型值）=====
-    default_mag = {'I': 45.0, 'D': 0.0, 'F': 50000.0}
-    if mag_params is None:
-        mag_params = default_mag
-    else:
-        for k, v in default_mag.items():
-            mag_params.setdefault(k, v)
+    OX,OY=np.meshgrid(obs_x,obs_y,indexing='ij')
+    ox_f=torch.tensor(OX.ravel(),dtype=torch.float64,device=DEVICE)
+    oy_f=torch.tensor(OY.ravel(),dtype=torch.float64,device=DEVICE)
 
-    I_deg = mag_params['I']
-    D_deg = mag_params['D']
-    F = mag_params['F']
+    kap_all=np.array([suscept_model[int(c[0]),int(c[1]),int(c[2])] for c in nonzero],dtype=np.float64)
+    cb_x1=np.array([xb[int(c[0])] for c in nonzero],dtype=np.float64)
+    cb_x2=np.array([xb[int(c[0])+1] for c in nonzero],dtype=np.float64)
+    cb_y1=np.array([yb[int(c[1])] for c in nonzero],dtype=np.float64)
+    cb_y2=np.array([yb[int(c[1])+1] for c in nonzero],dtype=np.float64)
+    cb_z1=np.array([zb[int(c[2])] for c in nonzero],dtype=np.float64)
+    cb_z2=np.array([zb[int(c[2])+1] for c in nonzero],dtype=np.float64)
 
-    # 方向余弦
-    I_rad = np.deg2rad(I_deg)
-    D_rad = np.deg2rad(D_deg)
-    alpha1 = np.cos(I_rad) * np.cos(D_rad)   # Easting 分量
-    alpha2 = np.cos(I_rad) * np.sin(D_rad)   # Northing 分量
-    alpha3 = np.sin(I_rad)                   # 向下分量
+    batch_size=max(50, n_nz//20); N=n_obs_x*n_obs_y
+    mag=torch.zeros(N,dtype=torch.float64,device=DEVICE)
 
-    # ===== 网格参数 =====
-    dx = grid_params['dx']
-    dy = grid_params['dy']
-    dz = grid_params['dz']
-    z0_obs = grid_params.get('z0', 0.0)
+    for start in range(0, n_nz, batch_size):
+        end=min(start+batch_size, n_nz)
+        b_kap=torch.tensor(kap_all[start:end],dtype=torch.float64,device=DEVICE)
+        b_x1=torch.tensor(cb_x1[start:end],dtype=torch.float64,device=DEVICE)
+        b_x2=torch.tensor(cb_x2[start:end],dtype=torch.float64,device=DEVICE)
+        b_y1=torch.tensor(cb_y1[start:end],dtype=torch.float64,device=DEVICE)
+        b_y2=torch.tensor(cb_y2[start:end],dtype=torch.float64,device=DEVICE)
+        b_z1=torch.tensor(cb_z1[start:end]+obs_z,dtype=torch.float64,device=DEVICE)
+        b_z2=torch.tensor(cb_z2[start:end]+obs_z,dtype=torch.float64,device=DEVICE)
+        contrib=_magnetic_kernel_cuda(ox_f,oy_f,b_x1,b_x2,b_y1,b_y2,b_z1,b_z2,
+                                       Mx,My,Mz,Fx,Fy,Fz)
+        mag+=torch.einsum('bn,b->n',contrib,b_kap)*prefactor
 
-    nx, ny, nz = kappa_model.shape
-    x_origin = grid_params.get('x0', 0.0)
-    y_origin = grid_params.get('y0', 0.0)
-
-    # 观测面坐标（展平为 1D）
-    obs_x = x_origin + (np.arange(nx) + 0.5) * dx
-    obs_y = y_origin + (np.arange(ny) + 0.5) * dy
-    OX_flat, OY_flat = np.meshgrid(obs_x, obs_y, indexing='ij')
-    OX_flat = OX_flat.ravel()  # (nx*ny,)
-    OY_flat = OY_flat.ravel()
-
-    magnetic_anomaly = np.zeros((nx, ny), dtype=np.float64)
-
-    # ===== 按深度层循环 =====
-    for k in range(nz):
-        z1 = k * dz
-        z2 = (k + 1) * dz
-
-        kappa_slice = kappa_model[:, :, k]
-
-        nonzero_mask = np.abs(kappa_slice) > 1e-10
-        if not np.any(nonzero_mask):
-            continue
-
-        ii, jj = np.where(nonzero_mask)
-        kappa_vals = kappa_slice[ii, jj]
-
-        # 对每个非零单元计算
-        for idx in range(len(ii)):
-            i_cell, j_cell = ii[idx], jj[idx]
-            kappa_val = kappa_vals[idx]
-
-            x1_c = x_origin + i_cell * dx
-            x2_c = x1_c + dx
-            y1_c = y_origin + j_cell * dy
-            y2_c = y1_c + dy
-
-            kernel = _magnetic_kernel_on_points(
-                OX_flat, OY_flat, z0_obs,
-                x1_c, x2_c, y1_c, y2_c, z1, z2,
-                alpha1, alpha2, alpha3
-            )  # (nx*ny,)
-
-            magnetic_anomaly += (kappa_val * F * kernel).reshape(nx, ny)
-
-    return magnetic_anomaly
+    return mag.cpu().numpy().reshape(n_obs_x,n_obs_y)
 
 
-def analytical_prism_magnetic(x0, y0, z0, x1, x2, y1, y2, z1, z2,
-                              kappa, I_deg=45.0, D_deg=0.0, F=50000.0):
-    """
-    单个棱柱体磁法异常解析解（直接调用核函数）。
+compute_magnetic_anomaly_vectorized=compute_magnetic_anomaly
 
-    Parameters
-    ----------
-    x0, y0 : array_like
-        观测点坐标 (m)。
-    z0 : float
-        观测面高度 (m)。
-    x1..z2 : float
-        棱柱体范围 (m)。
-    kappa : float
-        磁化率 (SI)。
-    I_deg, D_deg : float
-        磁倾角、偏角 (度)。
-    F : float
-        地磁场强度 (nT)。
 
-    Returns
-    -------
-    delta_T : ndarray
-        总场异常 (nT)。
-    """
-    x0_arr = np.asarray(x0, dtype=np.float64)
-    y0_arr = np.asarray(y0, dtype=np.float64)
-    orig_shape = x0_arr.shape
+def forward_magnetic(suscept_model, obs_height=10.0, nx=40, ny=40, nz=20,
+                     dx=20.0, dy=20.0, dz=20.0, n_obs=81,
+                     F_intensity=55000.0, F_declination=-7.0,
+                     F_inclination=60.0):
+    half=nx*dx/2.0; obs=np.linspace(-half-dx/2,half+dx/2,n_obs)
+    return compute_magnetic_anomaly(suscept_model,obs,obs,obs_height,
+                                    dx=dx,dy=dy,dz=dz,x0=-nx*dx/2.0,y0=-ny*dy/2.0,z0=0.0,
+                                    F_intensity=F_intensity,F_declination=F_declination,
+                                    F_inclination=F_inclination)
 
-    I_rad = np.deg2rad(I_deg)
-    D_rad = np.deg2rad(D_deg)
-    a1 = np.cos(I_rad) * np.cos(D_rad)
-    a2 = np.cos(I_rad) * np.sin(D_rad)
-    a3 = np.sin(I_rad)
 
-    kernel = _magnetic_kernel_on_points(
-        x0_arr.ravel(), y0_arr.ravel(), z0,
-        x1, x2, y1, y2, z1, z2, a1, a2, a3
-    )
-    return (kappa * F * kernel).reshape(orig_shape)
+def add_magnetic_noise(mag, noise_level=0.01):
+    max_signal=np.max(np.abs(mag))
+    if max_signal<1e-15: return mag
+    return mag+noise_level*max_signal*np.random.randn(*mag.shape)
+
+
+# ---- Test compatibility ----
+def _magnetic_field_array(X1,X2,Y1,Y2,Z1,Z2,Mx,My,Mz,Fx,Fy,Fz):
+    ax,ay,az=Mx*Fx,My*Fy,Mz*Fz;bxy=My*Fx+Mx*Fy;bxz=Mz*Fx+Mx*Fz;byz=Mz*Fy+My*Fz
+    total=np.zeros_like(X1,dtype=np.float64)
+    for i in range(2):
+        for j in range(2):
+            for k in range(2):
+                mu=(-1.0)**(i+j+k);xi=X1 if i==0 else X2;yj=Y1 if j==0 else Y2;zk=Z1 if k==0 else Z2
+                R=np.sqrt(xi**2+yj**2+zk**2)
+                t1=np.where(np.abs(xi*R)>1e-30,np.arctan2(yj*zk,xi*R),0.0)
+                t2=np.where(np.abs(yj*R)>1e-30,np.arctan2(xi*zk,yj*R),0.0)
+                t3=np.where(np.abs(zk*R)>1e-30,np.arctan2(xi*yj,zk*R),0.0)
+                lz=np.where(R+yj>1e-30,np.log(np.abs(R+yj)),0.0)
+                ly=np.where(R+zk>1e-30,np.log(np.abs(R+zk)),0.0)
+                lx=np.where(R+xi>1e-30,np.log(np.abs(R+xi)),0.0)
+                total+=mu*(ax*t1+ay*t2+az*t3-bxy*lz-bxz*ly-byz*lx)
+    return total
+
+def _magnetic_field_single_prism(x1,x2,y1,y2,z1,z2,Mx,My,Mz,Fx,Fy,Fz):
+    xs,ys,zs=[x1,x2],[y1,y2],[z1,z2];ax,ay,az=Mx*Fx,My*Fy,Mz*Fz
+    bxy=My*Fx+Mx*Fy;bxz=Mz*Fx+Mx*Fz;byz=Mz*Fy+My*Fz;total=0.0
+    for i in range(2):
+        for j in range(2):
+            for k in range(2):
+                mu=(-1.0)**(i+j+k);xi,yj,zk=xs[i],ys[j],zs[k];R=np.sqrt(xi**2+yj**2+zk**2)
+                if R<1e-15: continue
+                def sl(v): return 0.0 if abs(v)<1e-30 else np.log(abs(v))
+                total+=mu*(ax*np.arctan2(yj*zk,xi*R)+ay*np.arctan2(xi*zk,yj*R)+az*np.arctan2(xi*yj,zk*R)-bxy*sl(R+yj)-bxz*sl(R+zk)-byz*sl(R+xi))
+    return total
+
+_magnetic_field_array_vectorized=_magnetic_field_array
+_magnetic_field_array=_magnetic_field_array

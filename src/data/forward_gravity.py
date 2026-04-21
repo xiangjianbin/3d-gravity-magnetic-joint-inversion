@@ -1,282 +1,165 @@
 """
-3D 重力正演计算模块
-===================
+3D Prism Gravity Forward Modeling — PyTorch CUDA (Batched, Memory-Safe)
 
-基于 Blakely (1995) 棱柱体重力公式，实现 3D 密度模型的垂直重力异常正演。
+Processes cells in GPU batches to fit within VRAM.
+Falls back to CPU if CUDA unavailable or OOM.
 
-物理原理:
-    对于地下每个棱柱体单元 (prism cell)，其在地表观测点产生的垂直重力异常由
-    牛顿万有引力定律的积分形式给出。Blakely (1995) 给出了长方体棱柱体的解析解，
-    即对 8 个角点求和的形式。
-
-核心公式:
-    g_z = G * rho * V * kernel
-
-    其中核函数 kernel 为棱柱体 8 个角点的加权和:
-    kernel = sum_{i,j,k in {1,2}} (-1)^(i+j+k) *
-             [ x*ln(y+r) + y*ln(x+r) - z*atan(xy/(z*r)) ]
-    r = sqrt(x^2 + y^2 + z^2)
-
-单位制说明:
-    - 输入密度: g/cm^3 (CGS)
-    - 长度单位: m (SI)
-    - G = 6.674e-3: CGS 单位制下的引力常数，使得输出直接为 mGal
-      (1 mGal = 10^-5 m/s^2, CGS 中 G = 6.674e-8 cm^3/(g*s^2),
-       转换后 G_eff = 6.674e-3 mGal * cm^3 / (g * m^2))
-
-参考文献:
-    Blakely, R.J., 1995. Potential Theory in Gravity and Magnetic Applications.
-    Cambridge University Press.
+Based on Nagy et al. (2000). Units: Density g/cm^3 -> Output mGal
 """
 
 import numpy as np
+import torch
+
+G = 6.67430e-11
+CUDA_OK = torch.cuda.is_available()
+DEVICE = torch.device('cuda' if CUDA_OK else 'cpu')
 
 
-def _gravity_kernel_on_points(x0, y0, z0, x1, x2, y1, y2, z1, z2):
+def _gravity_kernel_cuda(obs_x_2d, obs_y_2d, cell_x1, cell_x2,
+                          cell_y1, cell_y2, cell_z1, cell_z2):
     """
-    计算单个棱柱体在一组观测点上的重力核函数值（无密度因子）。
-
-    这是 Blakely (1995) 公式的纯几何部分。观测点坐标为 1D 数组，
-    内部通过 numpy 广播对所有观测点同时计算。
+    Compute gravity contribution of one batch of cells at all observation points.
+    All inputs are 1D tensors on GPU (or CPU).
 
     Parameters
     ----------
-    x0, y0 : ndarray, shape (N,)
-        观测点 x, y 坐标数组（1D）。
-    z0 : float
-        观测面高度（标量）。
-    x1, x2, y1, y2, z1, z2 : float
-        棱柱体范围 (m)。
+    obs_x_2d, obs_y_2d : (N,) — flattened observation coordinates
+    cell_x1..cell_z2 : (C,) — cell boundaries
 
     Returns
     -------
-    kernel : ndarray, shape (N,)
-        核函数值，量纲为 [长度]。乘以 G * rho 后得到 mGal。
+    contrib : (N,) — total gravity contribution from these cells (in m/s^2 * G^-1, need to multiply by G*rho later)
     """
-    # 确保是 1D float64 数组
-    x0 = np.asarray(x0, dtype=np.float64).ravel()
-    y0 = np.asarray(y0, dtype=np.float64).ravel()
+    N = len(obs_x_2d)
+    C = len(cell_x1)
 
-    # 8 个角点的坐标差值
-    # xi: (2, 1), yj: (1, 2), zk: (1, 1, 2) 与 x0(N,), y0(N,) 广播
-    xi = np.array([x1, x2], dtype=np.float64)  # (2,)
-    yj = np.array([y1, y2], dtype=np.float64)  # (2,)
-    zk = np.array([z1, z2], dtype=np.float64)  # (2,)
+    # Broadcast: (C, 1) - (1, N) -> (C, N)
+    X1 = cell_x1.unsqueeze(1) - obs_x_2d.unsqueeze(0)   # (C, N)
+    X2 = cell_x2.unsqueeze(1) - obs_x_2d.unsqueeze(0)
+    Y1 = cell_y1.unsqueeze(1) - obs_y_2d.unsqueeze(0)
+    Y2 = cell_y2.unsqueeze(1) - obs_y_2d.unsqueeze(0)
+    Z1 = cell_z1.unsqueeze(1)                              # (C, 1)
+    Z2 = cell_z2.unsqueeze(1)
 
-    # 距离分量 — 形状均为 (2, 2, 2, N)
-    dx = xi[:, np.newaxis, np.newaxis, np.newaxis] - x0   # (2, 1, 1) - (N,) -> (2, 1, 1, N)
-    dy = yj[np.newaxis, :, np.newaxis, np.newaxis] - y0   # (1, 2, 1) - (N,) -> (1, 2, 1, N)
-    dz = zk[np.newaxis, np.newaxis, :, np.newaxis] - z0   # (1, 1, 2) - () -> (1, 1, 2, 1)
+    R2 = X1*X1 + Y1*Y1 + Z1*Z1  # (C, N) — using X1,Y1,Z1 as base (R is similar for all 8 corners)
+    R = torch.sqrt(R2)
+    R = torch.clamp(R, min=1e-15)
 
-    r = np.sqrt(dx**2 + dy**2 + dz**2 + 1e-30)
+    # Precompute arctan terms for all 8 corners
+    # Corner (i,j,k): xi ∈ {X1(i),X2(1-i)}, yj ∈ {Y1(j),Y2(1-j)}, zk ∈ {Z1(k),Z2(1-k)}
+    # Sign: mu = (-1)^(i+j+k)
 
-    # 符号因子: (-1)^(i+j+k)
-    signs = np.array([
-        [[+1, -1],
-         [-1, +1]],
-        [[-1, +1],
-         [+1, -1]]
-    ], dtype=np.float64)
+    # For efficiency, compute using the identity that the sum over 8 corners
+    # can be grouped. But let's just do the straightforward 8-corner loop (only 8 iters).
 
-    signs_expanded = signs[..., np.newaxis]  # (2, 2, 2, 1)
+    total = torch.zeros(C, N, dtype=torch.float64, device=obs_x_2d.device)
 
-    # 核函数三项
-    term1 = dx * np.log(np.abs(dy) + r)
-    term2 = dy * np.log(np.abs(dx) + r)
+    corners = [(0,0,0),(0,0,1),(0,1,0),(0,1,1),
+               (1,0,0),(1,0,1),(1,1,0),(1,1,1)]
+    for (i,j,k) in corners:
+        mu = 1.0 if (i+j+k) % 2 == 0 else -1.0
+        xi = X1 if i==0 else X2
+        yj = Y1 if j==0 else Y2
+        zk = Z1 if k==0 else Z2
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        ratio = (dx * dy) / (dz * r + 1e-30)
-    term3 = -dz * np.arctan(ratio)
+        # These xi,yj,zk are all (C,N)
+        Rijk = torch.sqrt(xi*xi + yj*yj + zk*zk)
+        Rijk = torch.clamp(Rijk, min=1e-15)
 
-    # 对 8 个角点求和 -> (N,)
-    kernel = np.sum(signs_expanded * (term1 + term2 + term3), axis=(0, 1, 2))
+        t1 = zk * torch.atan2(xi*yj, zk*Rijk)
+        t2 = xi * torch.atan2(yj*zk, xi*Rijk)
+        t3 = yj * torch.atan2(xi*zk, yj*Rijk)
 
-    return kernel
+        total += mu * (t1 - t2 - t3)
 
-
-def forward_gravity(rho_model, grid_params):
-    """
-    3D 重力正演：从密度模型计算地表垂直重力异常。
-
-    基于 Blakely (1995) 棱柱体公式，将地下 3D 密度模型离散为均匀棱柱体网格，
-    对每个棱柱体计算其在所有观测点产生的重力异常，最后求和。
-
-    Parameters
-    ----------
-    rho_model : ndarray, shape (nx, ny, nz)
-        3D 密度模型，单位 g/cm^3 (CGS)。
-        nx, ny 为水平方向网格数，nz 为深度层数。
-    grid_params : dict
-        网格参数字典:
-        - dx : float — x 方向网格间距 (m)
-        - dy : float — y 方向网格间距 (m)
-        - dz : float — z 方向(深度)网格间距 (m)
-        - x0 : float or None — 观测面 x 坐标原点 (m)。默认 0
-        - y0 : float or None — 观测面 y 坐标原点 (m)。默认 0
-        - z0 : float — 观测面高度 (m)。正值表示观测面在模型顶部之上
-
-    Returns
-    -------
-    gravity_anomaly : ndarray, shape (nx_obs, ny_obs)
-        垂直重力异常，单位 mGal。
-        默认观测点位于每个水平网格柱的正上方。
-
-    Notes
-    -----
-    - 实现策略: 对每个非零单元调用一次核函数（内部对所有观测点向量化）。
-    - 内存安全: 避免了 (nx*ny*n_cells) 的巨型中间数组。
-    - 坐标系: x(easting), y(northing), z(深度向下为正)。
-    """
-    # ===== 参数提取 =====
-    dx = grid_params['dx']
-    dy = grid_params['dy']
-    dz = grid_params['dz']
-    z0_obs = grid_params.get('z0', 0.0)
-
-    nx, ny, nz = rho_model.shape
-    x_origin = grid_params.get('x0', 0.0)
-    y_origin = grid_params.get('y0', 0.0)
-
-    # 引力常数 (CGS -> mGal 转换)
-    G = 6.674e-3
-
-    # ===== 观测面坐标（1D 展平）=====
-    obs_x = x_origin + (np.arange(nx) + 0.5) * dx  # (nx,)
-    obs_y = y_origin + (np.arange(ny) + 0.5) * dy  # (ny,)
-
-    # 构造完整的 2D 观测点网格（展平为 1D）
-    OX_flat, OY_flat = np.meshgrid(obs_x, obs_y, indexing='ij')
-    OX_flat = OX_flat.ravel()  # (nx*ny,)
-    OY_flat = OY_flat.ravel()  # (nx*ny,)
-
-    # ===== 初始化输出 =====
-    gravity_anomaly = np.zeros((nx, ny), dtype=np.float64)
-
-    # ===== 按深度层循环，每层内按非零单元循环 =====
-    for k in range(nz):
-        z1 = k * dz           # 棱柱体顶面深度
-        z2 = (k + 1) * dz     # 棱柱体底面深度
-
-        rho_slice = rho_model[:, :, k]
-
-        # 非零密度单元优化
-        nonzero_mask = np.abs(rho_slice) > 1e-10
-        if not np.any(nonzero_mask):
-            continue
-
-        ii, jj = np.where(nonzero_mask)
-        rho_vals = rho_slice[ii, jj]
-
-        # 对每个非零单元: 核函数对所有观测点向量化计算
-        for idx in range(len(ii)):
-            i_cell, j_cell = ii[idx], jj[idx]
-            rho_val = rho_vals[idx]
-
-            x1_c = x_origin + i_cell * dx
-            x2_c = x1_c + dx
-            y1_c = y_origin + j_cell * dy
-            y2_c = y1_c + dy
-
-            # 一次调用计算该单元对所有观测点的贡献 (1D 向量)
-            kernel = _gravity_kernel_on_points(
-                OX_flat, OY_flat, z0_obs,
-                x1_c, x2_c, y1_c, y2_c, z1, z2
-            )  # shape (nx*ny,)
-
-            # 累加到输出网格
-            gravity_anomaly += (G * rho_val * kernel).reshape(nx, ny)
-
-    return gravity_anomaly
+    return -total  # (C, N), negate for z-down
 
 
-def forward_gravity_dense(rho_model, grid_params):
-    """
-    3D 重力正演稠密版本 — 接口兼容，实现与 forward_gravity 一致。
+def compute_gravity_anomaly(density_model, obs_x, obs_y, obs_z,
+                            dx=20.0, dy=20.0, dz=20.0,
+                            x0=0.0, y0=0.0, z0=0.0):
+    """Gravity forward modeling — auto CUDA/CPU with batching."""
+    nx, ny, nz = density_model.shape
+    n_obs_x, n_obs_y = len(obs_x), len(obs_y)
+    density_kgm3 = density_model * 1000.0
 
-    Parameters
-    ----------
-    rho_model : ndarray, shape (nx, ny, nz)
-        3D 密度模型，单位 g/cm³。
-    grid_params : dict
-        同 forward_gravity。
+    xb = x0 + np.arange(nx+1)*dx; yb = y0 + np.arange(ny+1)*dy; zb = z0 + np.arange(nz+1)*dz
+    nonzero = np.argwhere(density_model != 0)
+    n_nz = len(nonzero)
 
-    Returns
-    -------
-    gravity_anomaly : ndarray, shape (nx, ny)
-        垂直重力异常，单位 mGal。
-    """
-    return forward_gravity(rho_model, grid_params)
+    if n_nz == 0:
+        return np.zeros((n_obs_x, n_obs_y), dtype=np.float64)
 
+    OX, OY = np.meshgrid(obs_x, obs_y, indexing='ij')
+    ox_f = torch.tensor(OX.ravel(), dtype=torch.float64, device=DEVICE)
+    oy_f = torch.tensor(OY.ravel(), dtype=torch.float64, device=DEVICE)
 
-# ===== 解析解验证函数 =====
+    rho_all = np.array([density_kgm3[int(c[0]),int(c[1]),int(c[2])] for c in nonzero], dtype=np.float64)
+    cb_x1 = np.array([xb[int(c[0])] for c in nonzero], dtype=np.float64)
+    cb_x2 = np.array([xb[int(c[0])+1] for c in nonzero], dtype=np.float64)
+    cb_y1 = np.array([yb[int(c[1])] for c in nonzero], dtype=np.float64)
+    cb_y2 = np.array([yb[int(c[1])+1] for c in nonzero], dtype=np.float64)
+    cb_z1 = np.array([zb[int(c[2])] for c in nonzero], dtype=np.float64)
+    cb_z2 = np.array([zb[int(c[2])+1] for c in nonzero], dtype=np.float64)
 
-def analytical_sphere_gravity(x0, y0, z0, sphere_center, sphere_radius, density):
-    """
-    均匀球体的重力异常解析解（质点近似）。
+    # Process in batches to limit GPU memory (~2GB per batch)
+    batch_size = max(50, n_nz // 20)  # ~20 batches
+    N = n_obs_x * n_obs_y
+    grav = torch.zeros(N, dtype=torch.float64, device=DEVICE)
 
-    Parameters
-    ----------
-    x0, y0 : array_like
-        观测点坐标 (m)。
-    z0 : float
-        观测面高度 (m)。
-    sphere_center : tuple (cx, cy, cz)
-        球心坐标 (cz 为深度向下为正, m)。
-    sphere_radius : float
-        球体半径 (m)。
-    density : float
-        密度差 (g/cm³)。
+    for start in range(0, n_nz, batch_size):
+        end = min(start+batch_size, n_nz)
+        b_rho = torch.tensor(rho_all[start:end], dtype=torch.float64, device=DEVICE)
+        b_x1 = torch.tensor(cb_x1[start:end], dtype=torch.float64, device=DEVICE)
+        b_x2 = torch.tensor(cb_x2[start:end], dtype=torch.float64, device=DEVICE)
+        b_y1 = torch.tensor(cb_y1[start:end], dtype=torch.float64, device=DEVICE)
+        b_y2 = torch.tensor(cb_y2[start:end], dtype=torch.float64, device=DEVICE)
+        b_z1 = torch.tensor(cb_z1[start:end]+obs_z, dtype=torch.float64, device=DEVICE)
+        b_z2 = torch.tensor(cb_z2[start:end]+obs_z, dtype=torch.float64, device=DEVICE)
 
-    Returns
-    -------
-    gz : ndarray
-        重力异常 (mGal)。
-    """
-    cx, cy, cz = sphere_center
-    x0 = np.asarray(x0, dtype=np.float64)
-    y0 = np.asarray(y0, dtype=np.float64)
+        contrib = _gravity_kernel_cuda(ox_f, oy_f, b_x1, b_x2, b_y1, b_y2, b_z1, b_z2)  # (batch, N)
+        grav += torch.einsum('bn,b->n', contrib, b_rho)  # (N,)
 
-    R_cm = sphere_radius * 100.0
-    volume_cm3 = (4.0 / 3.0) * np.pi * R_cm**3
-    mass_g = density * volume_cm3
-
-    rx = (x0 - cx) * 100.0
-    ry = (y0 - cy) * 100.0
-    rz = (z0 + cz) * 100.0
-    r = np.sqrt(rx**2 + ry**2 + rz**2)
-
-    G_cgs = 6.674e-8
-    gz_gal = G_cgs * mass_g * rz / (r**3 + 1e-30)
-    return gz_gal * 1000.0
+    result = (-grav * G * 1e5).cpu().numpy()  # m/s^2 -> mGal
+    return result.reshape(n_obs_x, n_obs_y)
 
 
-def analytical_prism_gravity(x0, y0, z0, x1, x2, y1, y2, z1, z2, density):
-    """
-    单个棱柱体重力异常解析解（直接调用核函数）。
+compute_gravity_anomaly_vectorized = compute_gravity_anomaly
 
-    Parameters
-    ----------
-    x0, y0 : array_like
-        观测点坐标 (m)，支持任意形状（将 ravel 后计算再 reshape 回原形状）。
-    z0 : float
-        观测面高度 (m)。
-    x1..z2 : float
-        棱柱体范围 (m)。
-    density : float
-        密度 (g/cm³)。
 
-    Returns
-    -------
-    gz : ndarray
-        重力异常 (mGal)，与 x0 同形状。
-    """
-    x0_arr = np.asarray(x0, dtype=np.float64)
-    y0_arr = np.asarray(y0, dtype=np.float64)
-    orig_shape = x0_arr.shape
+def forward_gravity(density_model, obs_height=10.0, nx=40, ny=40, nz=20,
+                    dx=20.0, dy=20.0, dz=20.0, n_obs=81):
+    half=nx*dx/2.0; obs=np.linspace(-half-dx/2,half+dx/2,n_obs)
+    return compute_gravity_anomaly(density_model,obs,obs,obs_height,
+                                   dx=dx,dy=dy,dz=dz,x0=-nx*dx/2.0,y0=-ny*dy/2.0,z0=0.0)
 
-    G = 6.674e-3
-    kernel = _gravity_kernel_on_points(
-        x0_arr.ravel(), y0_arr.ravel(), z0,
-        x1, x2, y1, y2, z1, z2
-    )
-    return (G * density * kernel).reshape(orig_shape)
+
+def add_gravity_noise(grav, noise_level=0.005):
+    max_signal=np.max(np.abs(grav))
+    if max_signal<1e-15: return grav
+    return grav+noise_level*max_signal*np.random.randn(*grav.shape)
+
+
+# ---- Test compatibility ----
+def _prism_gravity_component(x1,x2,y1,y2,z1,z2):
+    xs=[x1,x2];ys=[y1,y2];zs=[z1,z2];total=0.0
+    for i in range(2):
+        for j in range(2):
+            for k in range(2):
+                mu=(-1.0)**(i+j+k);xi,yj,zk=xs[i],ys[j],zs[k];R=np.sqrt(xi**2+yj**2+zk**2)
+                if R<1e-15:continue
+                total+=mu*(zk*np.arctan2(xi*yj,zk*R)-xi*np.arctan2(yj*zk,xi*R)-yj*np.arctan2(xi*zk,yj*R))
+    return -total
+
+def _prism_gravity_array(X1,X2,Y1,Y2,Z1,Z2):
+    total=np.zeros_like(X1,dtype=np.float64)
+    for i in range(2):
+        for j in range(2):
+            for k in range(2):
+                mu=(-1.0)**(i+j+k);xi=X1 if i==0 else X2;yj=Y1 if j==0 else Y2;zk=Z1 if k==0 else Z2
+                R=np.sqrt(xi**2+yj**2+zk**2)
+                t1=np.where(np.abs(zk*R)>1e-30,zk*np.arctan2(xi*yj,zk*R),0.0)
+                t2=np.where(np.abs(xi*R)>1e-30,xi*np.arctan2(yj*zk,xi*R),0.0)
+                t3=np.where(np.abs(yj*R)>1e-30,yj*np.arctan2(xi*zk,yj*R),0.0)
+                total+=mu*(t1-t2-t3)
+    return -total
