@@ -63,9 +63,10 @@ class ASPPPooling3d(nn.Module):
         super().__init__()
         self.pool = nn.AdaptiveAvgPool3d(1)  # 全局池化到 1x1x1
         self.conv = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm3d(out_channels),
+            nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=True),
             nn.ReLU(inplace=True),
+            # Note: No BatchNorm here — spatial size is 1×1×1 after global pool,
+            # BN requires >1 value per channel (PyTorch limitation)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

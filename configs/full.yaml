@@ -9,8 +9,8 @@ model:
 
 data:
   data_dir: data/
-  batch_size: 4          # Phase 4 will adjust based on actual VRAM measurements
-  num_workers: 2
+  batch_size: 8          # Optimized: 4.5GB/32GB at bs=8 (GPU_ALLOC_PLAN.md)
+  num_workers: 4
   train_split: 0.7
   val_split: 0.2
 
@@ -19,7 +19,7 @@ training:
   lr: 1e-3
   weight_decay: 1e-5
   use_amp: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false  # Not needed: 32GB VRAM, only 4.5GB used at bs=8
   max_grad_norm: 1.0
   seed: 42
   scheduler: cosine
