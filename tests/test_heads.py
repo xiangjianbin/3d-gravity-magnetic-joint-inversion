@@ -35,13 +35,12 @@ class TestTaskHead:
         out = head(x)
         assert out.shape == (2, 1, 8, 8, 10)
 
-    def test_classification_head_range(self):
-        """Classification head with sigmoid should output in [0, 1]."""
+    def test_classification_head_logits(self):
+        """Classification head outputs raw logits (sigmoid applied in loss)."""
         head = TaskHead(in_channels=40, out_depth=5, use_sigmoid=True)
         x = torch.randn(2, 40, 8, 8)
-        out = head(x)
-        assert out.min() >= 0.0, f"Min={out.min()}"
-        assert out.max() <= 1.0, f"Max={out.max()}"
+        out = head(x)  # raw logits, unbounded
+        assert out.shape == (2, 1, 8, 8, 5)
 
     def test_gradient_flow(self):
         """Gradients should flow through head."""
@@ -70,15 +69,14 @@ class TestTaskHeads:
             assert out.shape == (2, 1, 10, 10, 5), \
                 f"{key} shape {out.shape} != (2,1,10,10,5)"
 
-    def test_task3_sigmoid_range(self):
-        """Task 3 (structural similarity) should be in [0, 1]."""
+    def test_task3_logits_range(self):
+        """Task 3 (structural similarity) outputs raw logits."""
         heads = TaskHeads(in_channels=40, out_depth=5)
         x = torch.randn(2, 40, 10, 10)
         outputs = heads(x)
 
         t3 = outputs['task3']
-        assert t3.min() >= 0.0, f"task3 min={t3.min()}"
-        assert t3.max() <= 1.0, f"task3 max={t3.max()}"
+        assert t3.shape == (2, 1, 10, 10, 5)
 
     def test_param_count_positive(self):
         """Total parameter count should be positive."""
@@ -102,15 +100,14 @@ class TestJointInversionNet:
             assert outputs[key].shape == (2, 1, 40, 40, 20), \
                 f"{key} shape: {outputs[key].shape}"
 
-    def test_task3_sigmoid_in_full_net(self):
-        """Task 3 output from full net should be in [0, 1]."""
+    def test_task3_logits_in_full_net(self):
+        """Task 3 output from full net should be raw logits (unbounded)."""
         model = JointInversionNet()
         x = torch.randn(2, 2, 81, 81)
         outputs = model(x)
 
         t3 = outputs['task3']
-        assert t3.min() >= 0.0
-        assert t3.max() <= 1.0
+        assert t3.shape == (2, 1, 40, 40, 20)
 
     def test_full_network_gradients(self):
         """Gradients should flow through entire network."""

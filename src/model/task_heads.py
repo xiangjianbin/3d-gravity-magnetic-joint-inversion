@@ -54,13 +54,12 @@ class TaskHead(nn.Module):
             x: (B, 40, H, W) from ASPP.
         Returns:
             (B, 1, H, W, D) where D=out_depth.
+            Note: when use_sigmoid=True, raw logits are returned (sigmoid applied
+            in the loss function via BCEWithLogitsLoss for AMP compatibility).
         """
         feat = self.layers(x)  # (B, 1, H, W)
         # Expand 2D -> 3D: (B, 1, H, W) -> (B, 1, H, W, D) to match target format
         out = feat.unsqueeze(4).expand(-1, -1, -1, -1, self.out_depth).contiguous()
-
-        if self.use_sigmoid:
-            out = torch.sigmoid(out)
         return out
 
 
@@ -101,5 +100,5 @@ if __name__ == "__main__":
     for k, v in outs.items():
         print(f"  {k}: {v.shape}  [{v.min().item:.3f}, {v.max().item:.3f}]")
     assert all(v.shape == (2, 1, 40, 40, 20) for v in outs.values())
-    assert outs['task3'].min() >= 0 and outs['task3'].max() <= 1.0
+    # task3 outputs raw logits (unbounded)
     print("PASSED")

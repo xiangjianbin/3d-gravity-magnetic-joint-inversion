@@ -69,10 +69,8 @@ class JointInversionLoss(nn.Module):
 
         # Loss functions
         self.mse_loss = nn.MSELoss()
-        # Use BCEWithLogitsLoss for numerical stability (internal sigmoid)
-        self.bce_loss = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([bce_pos_weight])
-        )
+        # Use BCEWithLogitsLoss for numerical stability (internal sigmoid, AMP-safe)
+        self.bce_pos_weight = bce_pos_weight
 
         # Regularization strength
         self.leaky_relu_lambda = leaky_relu_lambda
@@ -110,15 +108,14 @@ class JointInversionLoss(nn.Module):
         loss_t2 = self.mse_loss(pred_t2, tgt_suscept)
         per_task['task2'] = loss_t2
 
-        # --- Task 3: Structural similarity (BCE) ---
-        # Note: task3 head output already has sigmoid applied in the head itself.
-        # For numerical stability we use raw logits here if available,
-        # otherwise use the sigmoid output with BCELoss.
-        pred_t3 = predictions['task3']   # already sigmoid-ed by head
+        # --- Task 3: Structural similarity (BCE with logits) ---
+        # task3 head outputs raw logits; BCEWithLogitsLoss is AMP-safe.
+        pred_t3 = predictions['task3']   # raw logits (no sigmoid in head)
         tgt_struct = targets['structural_sim']
-        # Clamp predictions for numerical safety with BCE
-        pred_t3_clamped = torch.clamp(pred_t3, min=1e-7, max=1.0 - 1e-7)
-        loss_t3 = F.binary_cross_entropy(pred_t3_clamped, tgt_struct)
+        bce_loss = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([self.bce_pos_weight], device=device)
+        )
+        loss_t3 = bce_loss(pred_t3, tgt_struct)
         per_task['task3'] = loss_t3
 
         # --- Task 4: Joint gravity inversion (MSE) ---

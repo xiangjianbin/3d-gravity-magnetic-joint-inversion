@@ -134,18 +134,44 @@ def setup_logger(name: str = 'train', log_file=None,
 # Configuration
 # ---------------------------------------------------------------------------
 
+def _coerce_types(cfg):
+    """Recursively coerce string values that look like numbers/bools to native types."""
+    if isinstance(cfg, dict):
+        return {k: _coerce_types(v) for k, v in cfg.items()}
+    elif isinstance(cfg, list):
+        return [_coerce_types(v) for v in cfg]
+    elif isinstance(cfg, str):
+        # Try int, then float, then bool
+        try:
+            return int(cfg)
+        except ValueError:
+            pass
+        try:
+            return float(cfg)
+        except ValueError:
+            pass
+        if cfg.lower() == 'true':
+            return True
+        if cfg.lower() == 'false':
+            return False
+        if cfg.lower() in ('null', 'none', '~'):
+            return None
+        return cfg
+    return cfg
+
+
 def load_config(config_path: str) -> dict:
-    """Load YAML configuration file.
+    """Load YAML configuration file with automatic type coercion.
 
     Args:
         config_path: Path to .yaml file.
 
     Returns:
-        Parsed configuration dict.
+        Parsed configuration dict with proper types.
     """
     with open(config_path, 'r') as f:
         cfg = yaml.safe_load(f)
-    return cfg
+    return _coerce_types(cfg)
 
 
 def save_json(data: dict, filepath: str) -> None:
