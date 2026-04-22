@@ -1,5 +1,5 @@
 # Smoke test configuration -- quick validation of the full pipeline
-# Small epochs, small batch size, fast iteration
+# 2 epochs, batch_size=2, minimal samples for fast iteration
 
 # Data
 data_dir: data
@@ -13,7 +13,7 @@ leaky_slope: 0.01
 
 # Training
 seed: 42
-epochs: 3
+epochs: 2
 lr: 1e-3
 betas: [0.9, 0.999]
 weight_decay: 1e-5
@@ -25,18 +25,18 @@ gamma: 0.5
 
 # Loss
 task_weights:
-  task1: 1.0
-  task2: 1.0
-  task3: 1.0
-  task4: 1.0
-  task5: 1.0
-leaky_relu_lambda: 1e-5
+  task1: 1.0            # Independent gravity inversion (MSE)
+  task2: 1.0            # Independent magnetic inversion (MSE)
+  task3: 1.0            # Structural similarity (BCE)
+  task4: 1.0            # Joint gravity inversion (MSE)
+  task5: 1.0            # Joint magnetic inversion (MSE)
+leaky_relu_lambda: 1e-5 # L2 weight penalty coefficient (Leaky-ReLU regularizer)
 
 # Regularization / stability
-grad_clip: 1.0
-use_amp: true
-early_stopping_patience: 100  # disabled for smoke test (won't trigger in 3 epochs)
+grad_clip: 1.0          # Max gradient norm for clipping
+use_amp: true           # Automatic Mixed Precision (saves VRAM on RTX 5000 Ada)
+early_stopping_patience: 100  # disabled for smoke test (won't trigger in 2 epochs)
 
 # Output
 output_dir: results/smoke_test
-save_every: 3
+save_every: 5           # Save every 5 epochs (won't fire in 2 epochs; best model still saved)

@@ -70,7 +70,9 @@ class JointInversionLoss(nn.Module):
         # Loss functions
         self.mse_loss = nn.MSELoss()
         # Use BCEWithLogitsLoss for numerical stability (internal sigmoid, AMP-safe)
-        self.bce_pos_weight = bce_pos_weight
+        # pos_weight will be set lazily on first forward call (needs device info)
+        self.bce_pos_weight_val = bce_pos_weight
+        self._bce_loss = None  # lazy-init per device
 
         # Regularization strength
         self.leaky_relu_lambda = leaky_relu_lambda
@@ -110,12 +112,14 @@ class JointInversionLoss(nn.Module):
 
         # --- Task 3: Structural similarity (BCE with logits) ---
         # task3 head outputs raw logits; BCEWithLogitsLoss is AMP-safe.
+        # Lazy-initialize BCE loss on correct device to avoid re-creating every forward.
         pred_t3 = predictions['task3']   # raw logits (no sigmoid in head)
         tgt_struct = targets['structural_sim']
-        bce_loss = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor([self.bce_pos_weight], device=device)
-        )
-        loss_t3 = bce_loss(pred_t3, tgt_struct)
+        if self._bce_loss is None or self._bce_loss.pos_weight.device != device:
+            self._bce_loss = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor([self.bce_pos_weight_val], device=device)
+            )
+        loss_t3 = self._bce_loss(pred_t3, tgt_struct)
         per_task['task3'] = loss_t3
 
         # --- Task 4: Joint gravity inversion (MSE) ---
@@ -177,7 +181,7 @@ if __name__ == "__main__":
     preds = {
         'task1': torch.randn(B, 1, 40, 40, 20, device=device),   # independent grav
         'task2': torch.randn(B, 1, 40, 40, 20, device=device),   # independent mag
-        'task3': torch.sigmoid(torch.randn(B, 1, 40, 40, 20, device=device)),  # struct sim
+        'task3': torch.randn(B, 1, 40, 40, 20, device=device),   # struct sim (raw logits for BCEWithLogitsLoss)
         'task4': torch.randn(B, 1, 40, 40, 20, device=device),   # joint grav
         'task5': torch.randn(B, 1, 40, 40, 20, device=device),   # joint mag
     }

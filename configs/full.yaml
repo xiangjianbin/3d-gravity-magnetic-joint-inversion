@@ -40,4 +40,4 @@ early_stopping_patience: 15  # Stop if no improvement for N epochs
 
 # Output
 output_dir: results/full_training
-save_every: 10          # Save checkpoint every N epochs
+save_every: 10          # Save checkpoint every N epochs (plus every 5 epochs for resume safety)

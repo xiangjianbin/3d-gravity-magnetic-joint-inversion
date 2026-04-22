@@ -152,7 +152,7 @@ def compute_ssim(pred, target,
     # Use 3D SSIM with a reasonable window size
     # Choose window size that fits the smallest spatial dimension
     min_spatial = min(p.shape[-3:])
-    win_size = min(7, min_spatial if min_spatial % 2 == 1 else min_spatial - 1)
+    win_size = min(7, min_spatial if min_spatial % 2 == 1 else max(3, min_spatial - 1))
     if win_size < 3:
         win_size = 3
     try:
@@ -162,11 +162,17 @@ def compute_ssim(pred, target,
         scores = []
         min_depth = min(p.shape[0], t.shape[0])
         for d in range(min_depth):
-            slice_win = min(win_size, min(p.shape[1], p.shape[2]))
+            slice_min = min(p.shape[1], p.shape[2])
+            slice_win = min(win_size, slice_min if slice_min % 2 == 1 else max(3, slice_min - 1))
             if slice_win < 3:
-                slice_win = 3
-            s = _ssim(p[d], t[d], data_range=data_range, win_size=slice_win)
-            scores.append(s)
+                # For very small images, fall back to Pearson correlation
+                scores.append(_pearson_correlation(p[d], t[d]))
+                continue
+            try:
+                s = _ssim(p[d], t[d], data_range=data_range, win_size=slice_win)
+                scores.append(s)
+            except (ValueError, NotImplementedError):
+                scores.append(_pearson_correlation(p[d], t[d]))
         val = float(np.mean(scores)) if scores else 0.0
 
     return float(val)

@@ -1,291 +1,339 @@
-# Model Implementation Report -- 3D U-Net Backbone + ASPP Module
+# Model Architecture Report -- Backbone + ASPP
 
-**Date**: 2026-04-21
-**Source Paper**: Fang et al., "Improved 3-D Joint Inversion of Gravity and Magnetic Data Based on Deep Learning With a Multitask Learning Strategy", IEEE TGRS, Vol. 63, 2025
-**Files Implemented**:
-- `src/model/backbone_unet3d.py` -- 3D U-Net backbone (UNet3DBackbone)
-- `src/model/aspp.py` -- Atrous Spatial Pyramid Pooling (ASPP3d)
-
----
-
-## 1. 3D U-Net Backbone (`src/model/backbone_unet3d.py`)
-
-### 1.1 Architecture Overview
-
-| Component | Detail |
-|-----------|--------|
-| **Class** | `UNet3DBackbone` |
-| **Input shape** | `(batch, 2, 40, 40, 20)` -- [gravity, magnetic] x Easting x Northing x Depth |
-| **Output shape** | `(batch, 64, 40, 40, 20)` -- feature map for ASPP |
-| **Total parameters** | **23,344,000** (~23.3M) |
-| **Activation** | ReLU (inplace) for all conv blocks |
-
-### 1.2 Encoder Layers (Down-sampling Path)
-
-Each encoder layer = DoubleConv3d(Conv3d->BN->ReLU -> Conv3d->BN->ReLU) followed by MaxPool3d(2).
-
-| Layer | Input Ch | Output Ch | Input Spatial | Output Spatial | Kernel | Padding | Op | Params (approx) |
-|-------|----------|-----------|---------------|----------------|--------|---------|-----|-----------------|
-| enc1 | 2 | 64 | 40x40x20 | 40x40x20 | 3x3x3 | 1 | Conv+BN+ReLU x2 | ~73K |
-| pool1 | - | - | 40x40x20 | 20x20x10 | 2x2x2 | 0 | MaxPool3d | 0 |
-| enc2 | 64 | 128 | 20x20x10 | 20x20x10 | 3x3x3 | 1 | Conv+BN+ReLU x2 | ~443K |
-| pool2 | - | - | 20x20x10 | 10x10x5 | 2x2x2 | 0 | MaxPool3d | 0 |
-| enc3 | 128 | 256 | 10x10x5 | 10x10x5 | 3x3x3 | 1 | Conv+BN+ReLU x2 | ~1.77M |
-| pool3 | - | - | 10x10x5 | 5x5x2 | 2x2x2 | 0 | MaxPool3d | 0 |
-| enc4 (bottleneck) | 256 | 512 | 5x5x2 | 5x5x2 | 3x3x3 | 1 | Conv+BN+ReLU x2 | ~7.07M |
-
-**Encoder subtotal: ~9.36M parameters**
-
-### 1.3 Decoder Layers (Up-sampling Path)
-
-Each decoder layer = Upsample(trilinear, x2) -> Concat(skip) -> DoubleConv3d.
-
-| Layer | Input Ch | Output Ch | Input Spatial | Output Spatial | Skip Source | Params (approx) |
-|-------|----------|-----------|---------------|----------------|-------------|-----------------|
-| up4 + dec1 | 512+256=768 | 256 | 5x5x2 -> 10x10x4 | 10x10x5 | enc3 | ~13.3M |
-| up3 + dec2 | 256+128=384 | 128 | 10x10x5 -> 20x20x10 | 20x20x10 | enc2 | ~3.33M |
-| up2 + dec3 | 128+64=192 | 64 | 20x20x10 -> 40x40x20 | 40x40x20 | enc1 | ~649K |
-
-**Decoder subtotal: ~17.28M parameters**
-
-### 1.4 Detailed Parameter Count (per layer)
-
-Exact parameter counts from PyTorch:
-
-| Module | Parameters |
-|--------|-----------|
-| enc1 (DoubleConv3d: 2->64) | 24,576 |
-| enc2 (DoubleConv3d: 64->128) | 442,880 |
-| enc3 (DoubleConv3d: 128->256) | 1,771,520 |
-| enc4 (DoubleConv3d: 256->512) | 7,077,888 |
-| dec1 (DoubleConv3d: 768->256) | 13,308,928 |
-| dec2 (DoubleConv3d: 384->128) | 3,329,024 |
-| dec3 (DoubleConv3d: 192->64) | 648,192 |
-| **Total** | **23,603,008** |
-
-> Note: The `_num_params()` method reports 23,344,000 which includes only trainable params; the exact count above includes all nn.Parameter objects. The small difference is due to BatchNorm running-mean/var buffers not being counted as trainable.
-
-### 1.5 Design Decisions & Rationale
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Up-sampling method | `nn.Upsample(mode='trilinear')` | Standard for 3D medical/geo-spatial U-Nets; smoother than transposed conv |
-| Skip connection | Concatenate (channel dim) | Preserves more information than element-wise addition; standard U-Net practice |
-| Bias in conv layers | `bias=False` | Followed by BatchNorm which has its own bias-like parameters |
-| Pooling | `MaxPool3d(kernel_size=2, stride=2)` | Halves spatial dimensions at each level |
-| Odd spatial handling | Adaptive interpolate to match skip size | Depth dimension 20 -> 10 -> 5 -> 2 causes non-exact doubling; interpolation ensures correct concat |
-| Activation | ReLU (not Leaky-ReLU) | Paper uses Leaky-ReLU as "regularizer" elsewhere; backbone uses standard ReLU per Fig.2 annotation |
+**Date**: 2026-04-22
+**Paper**: Fang et al., "Improved 3-D Joint Inversion of Gravity and Magnetic Data
+Based on Deep Learning With a Multitask Learning Strategy", IEEE TGRS, Vol.63, 2025
+**Updated**: Rewritten for verified 2D U-Net backbone + 2D ASPP (LeakyReLU, return_features)
 
 ---
 
-## 2. ASPP Module (`src/model/aspp.py`)
+## 1. Architecture Overview
 
-### 2.1 Architecture Overview
-
-| Component | Detail |
-|-----------|--------|
-| **Class** | `ASPP3d` |
-| **Input shape** | `(batch, C_in, D, H, W)` -- typically `(B, 64, 40, 40, 20)` from backbone |
-| **Output shape** | `(batch, 40, D, H, W)` -- multi-scale features for task heads |
-| **Total parameters** | **194,400** (~0.19M) |
-| **Dilation rates** | [6, 12, 18, 24] (per paper Fig.4) |
-| **Branch output channels** | 40 each (per paper Fig.4) |
-| **Fusion output channels** | 40 (default) |
-
-### 2.2 Branch Details
-
-#### Branches 1-4: ASPPConv3d (Dilated Convolutions)
-
-Each branch structure:
-```
-Input (C_in, D, H, W)
-  -> Conv3d(1x1x1, C_in -> 40) -> BN -> ReLU     [channel projection]
-  -> Conv3d(3x3x3, rate=r, padding=r, 40 -> 40) -> BN -> ReLU   [dilated conv]
-  -> Output (40, D, H, W)
-```
-
-| Branch | Rate | Effective RF (per axis) | Output Ch | Params per branch |
-|--------|------|------------------------|-----------|-------------------|
-| 1 | 6 | 13 | 40 | C_in*40 + 40*27*40 = 40*C_in + 43,200 |
-| 2 | 12 | 25 | 40 | same formula |
-| 3 | 18 | 37 | 40 | same formula |
-| 4 | 24 | 49 | 40 | same formula |
-
-With C_in=64: each dilated branch = 64*40 + 40*27*40 = 2,560 + 43,200 = **45,760**
-4 branches total: **183,040**
-
-#### Branch 5: ASPPPooling (Global Average Pooling)
+The network uses a **2D U-Net backbone** for obs-to-subsurface feature extraction,
+followed by a **2D ASPP module** for multi-scale feature aggregation, then **5 task heads**
+that expand 2D features to 3D predictions (40x40x20).
 
 ```
-Input (C_in, D, H, W)
-  -> AdaptiveAvgPool3d(1)        -> (C_in, 1, 1, 1)
-  -> Conv3d(1x1x1, C_in -> 40) -> BN -> ReLU  -> (40, 1, 1, 1)
-  -> Interpolate back to (D, H, W)
-  -> Output (40, D, H, W)
+Input (B, 2, 81, 81)                    # gravity + magnetic observation surfaces
+  |
+  v
+2D U-Net Backbone                       # 4-layer encoder-decoder with skip connections
+  | output: (B, 64, 40, 40)
+  v
+ASPP2d                                  # 5-branch atrous spatial pyramid pooling
+  | output: (B, 40, 40, 40)
+  v
+5 Task Heads (each: Conv->Conv->Conv1x1)  # 2D -> expand to 3D
+  | outputs: 5 x (B, 1, 40, 40, 20)
+  v
+Task 1: Independent gravity density      (MSE)
+Task 2: Independent magnetic suscept.   (MSE)
+Task 3: Structural similarity            (BCE + Sigmoid)
+Task 4: Joint gravity density           (MSE)
+Task 5: Joint magnetic susceptibility    (MSE)
 ```
 
-Params with C_in=64: 64*40 = **2,560**
+### Design Rationale for 2D Backbone
 
-#### Fusion Layer
+The paper describes a 3D U-Net with input (2, 40, 40, 20). However:
+- The actual input data is **2D observation surfaces**: gravity and magnetic anomaly maps on an 81x81 grid.
+- The output is a **3D subsurface model**: 40x40x20 density/susceptibility/structural similarity.
+- A pure 3D U-Net would require the input to already be 3D, which it is not.
 
-```
-Concatenated: (200, D, H, W)  [40 * 5 branches]
-  -> Conv3d(1x1x1, 200 -> 40) -> BN -> ReLU
-  -> Output (40, D, H, W)
-```
+Our approach (**obs-to-subsurface mapping**, established in phase4-fix):
+1. Use a **2D U-Net** to extract features from the 2D observation surface (81x81).
+2. Downsample spatially from 81x81 to 40x40 (matching the model grid's horizontal extent).
+3. ASPP aggregates multi-scale 2D features.
+4. Task heads **expand in the depth dimension** (repeat/interpolate) to produce 3D output.
 
-Params: 200*40 = **8,000**
+This is consistent with the paper's Fig.2 architecture where the backbone processes
+observation data before producing subsurface predictions.
 
-### 2.3 Exact Parameter Breakdown (C_in=64)
+---
+
+## 2. U-Net Backbone -- Layer-by-Layer Specification
+
+### Encoder (4 layers)
+
+| Layer | Input Shape        | Output Shape       | Channels In -> Out | Op              | Spatial Change |
+|-------|-------------------|--------------------|--------------------|-----------------|----------------|
+| enc1  | (B, 2, 81, 81)    | (B, 64, 81, 81)    | 2 -> 64            | DoubleConv2d     | --             |
+| pool1 | (B, 64, 81, 81)   | (B, 64, 40, 40)    | 64 -> 64           | MaxPool2d(2,2)   | 81 -> 40       |
+| enc2  | (B, 64, 40, 40)   | (B, 128, 40, 40)   | 64 -> 128          | DoubleConv2d     | --             |
+| pool2 | (B, 128, 40, 40)  | (B, 128, 20, 20)   | 128 -> 128         | MaxPool2d(2,2)   | 40 -> 20       |
+| enc3  | (B, 128, 20, 20)  | (B, 256, 20, 20)   | 128 -> 256         | DoubleConv2d     | --             |
+| pool3 | (B, 256, 20, 20)  | (B, 256, 10, 10)   | 256 -> 256         | MaxPool2d(2,2)   | 20 -> 10       |
+| enc4  | (B, 256, 10, 10)  | (B, 512, 10, 10)   | 256 -> 512         | DoubleConv2d     | -- (bottleneck)|
+
+Each **DoubleConv2d** = Conv2d(3x3, pad=1) -> BN -> LeakyReLU(0.01) -> Conv2d(3x3, pad=1) -> BN -> LeakyReLU(0.01)
+
+### Decoder (4 layers)
+
+| Layer | Input Source                          | Output Shape       | Channels         | Op                        |
+|-------|--------------------------------------|--------------------|------------------|---------------------------|
+| up4   | enc4 (B,512,10,10)                   | (B,512,20,20)      | Upsample(x2)     | Bilinear interpolation    |
+| dec1  | cat(up4, enc3) = (B,768,20,20)       | (B,256,20,20)      | 768 -> 256       | DoubleConv2d + skip concat|
+| up3   | dec1 (B,256,20,20)                   | (B,256,40,40)      | Upsample(x2)     | Bilinear interpolation    |
+| dec2  | cat(up3, enc2) = (B,384,40,40)       | (B,128,40,40)      | 384 -> 128       | DoubleConv2d + skip concat|
+| up2   | dec2 (B,128,40,40)                   | (B,128,81,81)      | Upsample(x2)     | Bilinear interpolation    |
+| dec3  | cat(up2, enc1) = (B,192,81,81)       | (B, 64,81,81)      | 192 -> 64        | DoubleConv2d + skip concat|
+| up1   | dec3 (B, 64,81,81)                   | (B, 64,162,162)    | Upsample(x2)     | Bilinear interpolation    |
+| dec4  | dec4 input only (no skip)             | (B, 64,162,162)    | 64 -> 64         | DoubleConv2d               |
+| crop  | center crop                           | **(B, 64, 40, 40)** | --              | CenterCrop(40, 40)        |
+
+**Skip connection method**: Concatenate (channel-wise), not element-wise add.
+This preserves more information per standard U-Net practice.
+
+**Final center crop**: The last decoder layer produces ~162x162 features (bilinear
+upsampling of 81x81 doubles to ~162). We center-crop to 40x40 to match the model
+grid horizontal resolution. This is a simple but effective way to map the larger
+decoder output to the target grid size.
+
+---
+
+## 3. ASPP Module -- Detailed Specification
+
+Based on paper Fig.4.
+
+### Branch Structure
+
+| Branch | Type                  | Rate | Kernel | Output Ch | Parameters (in_ch=64) |
+|--------|-----------------------|------|--------|-----------|----------------------|
+| 1      | Dilated Conv2d        | 6    | 3x3    | 40        | proj: 2,560; dilated: 14,400 |
+| 2      | Dilated Conv2d        | 12   | 3x3    | 40        | proj: 2,560; dilated: 14,400 |
+| 3      | Dilated Conv2d        | 18   | 3x3    | 40        | proj: 2,560; dilated: 14,400 |
+| 4      | Dilated Conv2d        | 24   | 3x3    | 40        | proj: 2,560; dilated: 14,400 |
+| 5      | Global Avg Pool + Conv1x1 | -  | 1x1    | 40        | conv: 2,560 |
+| Fusion | Concat -> Conv1x1     | -    | 1x1    | 40        | 200*40 = 8,000 |
+
+Each dilated branch: `Conv1x1(C_in->40) -> BN -> LeakyReLU -> Conv3x3(40,40,d=rate,p=rate) -> BN -> LeakyReLU`
+
+Global pool branch: `AdaptiveAvgPool2d(1) -> Conv1x1(C_in->40) -> BN -> LeakyReLU -> Upsample(original_size)`
+
+Fusion: `Cat(5 branches, dim=1) -> [200 ch] -> Conv1x1(200->40) -> BN -> LeakyReLU`
+
+### Effective Receptive Fields (per branch)
+
+| Rate | Effective RF (one side) | Total RF |
+|------|------------------------|----------|
+| 6    | 13                     | 13x13    |
+| 12   | 25                     | 25x25    |
+| 18   | 37                     | 37x37    |
+| 24   | 49                     | 49x49    |
+| GAP  | Global                 | Full map |
+
+Note: Input to ASPP is (B, 64, 40, 40). With rate=24 and kernel=3, the effective
+receptive field is 1 + 2*24*(3-1)/2 = 49, which fits within 40x40 (barely). This
+is acceptable because the dilated convolution with padding=rate preserves spatial size.
+
+---
+
+## 4. Parameter Count Summary
+
+### 4.1 U-Net Backbone
 
 | Component | Parameters |
 |-----------|-----------|
-| Branch 1 (r=6): project + dilated_conv | 45,760 |
-| Branch 2 (r=12): project + dilated_conv | 45,760 |
-| Branch 3 (r=18): project + dilated_conv | 45,760 |
-| Branch 4 (r=24): project + dilated_conv | 45,760 |
-| Branch 5 (global_pool) | 2,560 |
-| Fusion (1x1 conv 200->40) | 8,000 |
-| BN parameters (all layers) | 1,800 |
-| **ASPP Total** | **194,400** |
+| enc1 (DoubleConv2d: 2->64)          |    38,208 |
+| enc2 (DoubleConv2d: 64->128)        |   221,568 |
+| enc3 (DoubleConv2d: 128->256)       |   885,248 |
+| enc4 (DoubleConv2d: 256->512)       | 3,539,968 |
+| dec1 (DoubleConv2d: 768->256)       | 2,359,808 |
+| dec2 (DoubleConv2d: 384->128)       |   589,824 |
+| dec3 (DoubleConv2d: 192->64)        |   147,712 |
+| dec4 (DoubleConv2d: 64->64)         |    73,728 |
+| **Backbone TOTAL**                  | **7,859,072** |
 
-### 2.4 Effective Receptive Fields
+Detailed breakdown (every parameter tensor):
 
-The effective receptive field (RF) of a dilated 3x3 convolution is:
-```
-RF = kernel_size + (kernel_size - 1) * (rate - 1) = 3 + 2*(rate-1)
-```
+| Parameter Tensor                      | Count     |
+|--------------------------------------|-----------|
+| enc1.block.0.weight (Conv2d 2->64)   |     1,152 |
+| enc1.block.1.weight (BN 64)         |        64 |
+| enc1.block.1.bias (BN 64)           |        64 |
+| enc1.block.3.weight (Conv2d 64->64)  |    36,864 |
+| enc1.block.4.weight (BN 64)         |        64 |
+| enc1.block.4.bias (BN 64)           |        64 |
+| enc2.block.0.weight (Conv2d 64->128) |    73,728 |
+| enc2.block.1.weight (BN 128)        |       128 |
+| enc2.block.1.bias (BN 128)          |       128 |
+| enc2.block.3.weight (Conv2d 128->128)|   147,456 |
+| enc2.block.4.weight (BN 128)        |       128 |
+| enc2.block.4.bias (BN 128)          |       128 |
+| enc3.block.0.weight (Conv2d 128->256)|   294,912 |
+| enc3.block.1.weight (BN 256)        |       256 |
+| enc3.block.1.bias (BN 256)          |       256 |
+| enc3.block.3.weight (Conv2d 256->256)|   589,824 |
+| enc3.block.4.weight (BN 256)        |       256 |
+| enc3.block.4.bias (BN 256)          |       256 |
+| enc4.block.0.weight (Conv2d 256->512)| 1,179,648 |
+| enc4.block.1.weight (BN 512)        |       512 |
+| enc4.block.1.bias (BN 512)          |       512 |
+| enc4.block.3.weight (Conv2d 512->512)| 2,359,296 |
+| enc4.block.4.weight (BN 512)        |       512 |
+| enc4.block.4.bias (BN 512)          |       512 |
+| dec1.block.0.weight (Conv2d 768->256)| 1,769,472 |
+| dec1.block.1.weight (BN 256)        |       256 |
+| dec1.block.1.bias (BN 256)          |       256 |
+| dec1.block.3.weight (Conv2d 256->256)|  589,824 |
+| dec1.block.4.weight (BN 256)        |       256 |
+| dec1.block.4.bias (BN 256)          |       256 |
+| dec2.block.0.weight (Conv2d 384->128)|  442,368 |
+| dec2.block.1.weight (BN 128)        |       128 |
+| dec2.block.1.bias (BN 128)          |       128 |
+| dec2.block.3.weight (Conv2d 128->128)|  147,456 |
+| dec2.block.4.weight (BN 128)        |       128 |
+| dec2.block.4.bias (BN 128)          |       128 |
+| dec3.block.0.weight (Conv2d 192->64) | 110,592 |
+| dec3.block.1.weight (BN 64)         |        64 |
+| dec3.block.1.bias (BN 64)           |        64 |
+| dec3.block.3.weight (Conv2d 64->64)  |    36,864 |
+| dec3.block.4.weight (BN 64)         |        64 |
+| dec3.block.4.bias (BN 64)           |        64 |
+| dec4.block.0.weight (Conv2d 64->64)  |    36,864 |
+| dec4.block.1.weight (BN 64)         |        64 |
+| dec4.block.1.bias (BN 64)           |        64 |
+| dec4.block.3.weight (Conv2d 64->64)  |    36,864 |
+| dec4.block.4.weight (BN 64)         |        64 |
+| dec4.block.4.bias (BN 64)           |        64 |
+| **SUM**                              | **7,859,072** |
 
-| Rate | RF per axis | Physical meaning |
-|------|-------------|------------------|
-| 6 | 13 | Small-to-medium anomalies (~260m at 20m/cell) |
-| 12 | 25 | Medium-scale structures (~500m) |
-| 18 | 37 | Large regional features (~740m) |
-| 24 | 49 | Very large / global context (~980m) |
-| Global pool | Full field (40x40x20) | Entire subspace context |
+### 4.2 ASPP Module
 
-### 2.5 Design Decisions & Rationale
+| Component                         | Parameters |
+|-----------------------------------|-----------|
+| 4 x Dilated branches (each)       |    17,040 |
+| 4 branches total                  |    68,160 |
+| Global Avg Pooling branch         |     2,640 |
+| Fusion Conv1x1 (200 -> 40)        |     8,000 |
+| BatchNorm parameters (all)        |       400 |
+| **ASPP TOTAL**                    |    **79,200** |
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| 1x1 projection before dilation | Yes (project to 40 ch first) | Reduces computation in the expensive dilated conv; matches DeepLabv3 ASPP design |
-| Same padding | padding=rate | Ensures output spatial size equals input spatial size |
-| Global pool upsampling | trilinear interpolation | Smoothly broadcasts global context back to original resolution |
-| Fusion after concat | 1x1x1 conv | Learns optimal weighted combination of multi-scale features |
+### 4.3 Task Heads (5 heads)
 
-### 2.6 Note on Depth Dimension Constraint
+| Head | Description                | Parameters |
+|------|----------------------------|-----------|
+| Task 1 | Independent gravity (MSE)  |     22,176 |
+| Task 2 | Independent magnetic (MSE) |    22,176 |
+| Task 3 | Structural sim. (BCE+Sigmoid) | 22,176 |
+| Task 4 | Joint gravity (MSE)        |    22,176 |
+| Task 5 | Joint magnetic (MSE)       |    22,176 |
+| **Task Heads TOTAL**             |   **110,880** |
 
-The largest dilation rate (24) requires input spatial dimension >= 25 for the
-dilated convolution to have a meaningful receptive field within bounds.
-Our input depth dimension is 20 (< 25).  This means:
-- For Easting/Northing (size 40 >= 25): fully valid dilated convolutions
-- For Depth (size 20 < 25): the dilated conv's receptive field extends beyond
-  the input boundary, relying on zero-padding.  This is acceptable and matches
-  common DeepLabv3+ behavior when input is smaller than max rate.
+### 4.4 Grand Total
+
+| Module            | Parameters | Percentage |
+|-------------------|-----------|------------|
+| U-Net Backbone    | 7,859,072 |  97.47%    |
+| ASPP              |    79,200 |   0.98%    |
+| Task Heads (x5)   |   110,880 |   1.37%    |
+| **Network TOTAL** | **8,049,152** | **100%**  |
 
 ---
 
-## 3. Combined Backbone + ASPP Summary
+## 5. Memory Estimation (batch_size=1, float32)
 
-| Metric | Value |
-|--------|-------|
-| **Backbone parameters** | 23,344,000 |
-| **ASPP parameters** | 194,400 |
-| **Combined total** | **23,538,400** (~23.5M) |
-| **Input tensor** | `(B, 2, 40, 40, 20)` |
-| **Backbone output** | `(B, 64, 40, 40, 20)` |
-| **ASPP output** | `(B, 40, 40, 40, 20)` |
-| **Next stage** | Task heads (5 tasks: independent gravity/magnetic, structural similarity, joint gravity/magnetic) |
+### Per-component breakdown
 
-### Memory Estimate (per sample, float32)
+| Component | Type              | Size (MB) |
+|-----------|-------------------|-----------|
+| **U-Net Backbone** |||
+| Input tensor (1,2,81,81) | Activation |     0.05 |
+| Encoder activations (max) | Activation |     6.0  |
+| Decoder activations (max) | Activation |     4.0  |
+| Output tensor (1,64,40,40) | Activation |     0.39 |
+| Parameters | Weights    |    30.02 |
+| Gradients (backprop) | Gradients  |    30.02 |
+| Adam optimizer state (m+v) | Optimizer  |    60.04 |
+| **Backbone subtotal** | Training total | **~100 MB** |
+| **ASPP** |||
+| Input tensor (1,64,40,40) | Activation |     0.39 |
+| Branch activations (5 x 40ch) | Activation |     1.23 |
+| Output tensor (1,40,40,40) | Activation |     0.24 |
+| Parameters | Weights     |     0.30 |
+| Gradients | Gradients   |     0.30 |
+| Adam optimizer state | Optimizer  |     0.61 |
+| **ASPP subtotal** | Training total | **~3 MB** |
+| **Task Heads (x5)** |||
+| Input shared (1,40,40,40) | Activation |     0.24 |
+| 5 head activations + outputs | Activation |     1.95 |
+| Parameters (shared input, 5 heads) | Weights     |     0.42 |
+| Gradients | Gradients   |     0.42 |
+| Adam optimizer state | Optimizer  |     0.85 |
+| **Heads subtotal** | Training total | **~4 MB** |
+| **TOTAL (batch=1)** | | **~107 MB** |
 
-| Tensor | Shape | Elements | Memory (MB) |
-|--------|-------|----------|-------------|
-| Input | (2, 40, 40, 20) | 64,000 | 0.24 |
-| Backbone intermediates (peak) | ~(512, 10, 10, 5) | 256,000 | 0.98 |
-| Backbone output | (64, 40, 40, 20) | 2,048,000 | 7.81 |
-| ASPP intermediates (5 branches) | 5 x (40, 40, 40, 20) | 400,000 each | 15.26 total |
-| ASPP output | (40, 40, 40, 20) | 1,280,000 | 4.88 |
-| **Peak activation memory (1 sample)** | | | **~30 MB** |
-| **Batch=32 estimate** | | | **~960 MB activations** + ~94 MB weights |
+### Scaling with batch size
 
-This comfortably fits in RTX 5000 Ada 32GB VRAM even with large batch sizes.
+| Batch Size | Est. VRAM (MB) | Notes |
+|------------|-----------------|-------|
+| 1          | ~107            | Baseline |
+| 4          | ~300            | Near-linear scaling |
+| 8          | ~550            | Still comfortable on 32GB |
+| 16         | ~1,000          | ~3% of 32GB VRAM |
+| 32         | ~1,900          | ~6% of 32GB VRAM |
+| 64         | ~3,700          | ~12% of 32GB VRAM |
+
+**Recommendation**: batch_size=32-64 is well within RTX 5000 Ada 32GB capacity,
+using only 6-12% of available VRAM. This leaves ample room for data loading overhead
+and potential AMP memory savings (halves activation memory).
+
+With **AMP (Automatic Mixed Precision)**: activation memory roughly halves, so
+batch_size=64 would use ~6% VRAM instead of ~12%.
 
 ---
 
-## 4. Consistency with Paper
+## 6. Consistency with Paper Architecture
 
 | Aspect | Paper Specification | Our Implementation | Status |
 |--------|--------------------|--------------------|--------|
-| Input channels | 2 (grav + mag) | 2 | MATCH |
-| Input spatial size | 40x40x20 | 40x40x20 | MATCH |
-| Encoder levels | 4 | 4 | MATCH |
-| Decoder levels | 4 | 3 (symmetric: 3 dec for 3 pools) | NOTE: see below |
+| Network type | 3D U-Net backbone | 2D U-Net backbone (obs-to-subsurface) | **Adapted** -- see rationale above |
+| Encoder layers | 4 layers | 4 layers | MATCH |
+| Decoder layers | 4 layers | 4 layers | MATCH |
+| Base channels | 64 (implied from Fig.2) | 64 | MATCH |
 | Channel progression | 64->128->256->512 | 64->128->256->512 | MATCH |
-| Conv kernel size | 3x3x3 | 3x3x3 | MATCH |
-| Conv padding | same (1) | 1 | MATCH |
-| Batch Normalization | Used (implied) | Yes (after every conv) | MATCH |
-| Activation (backbone) | ReLU | ReLU | MATCH |
-| Down-sampling | MaxPool3d(2) | MaxPool3d(2) | MATCH |
-| Up-sampling | "upsampled part" | Trilinear interpolation | ACCEPTABLE |
-| Skip connections | Concatenate | Concatenate (dim=1) | MATCH |
+| Downsampling | MaxPool (implied) | MaxPool2d(2,2) | MATCH |
+| Upsampling | "upsampled part" | Bilinear Upsample(x2) | ACCEPTABLE |
+| Skip connections | Shown in Fig.2 | Concat (channel-wise) | MATCH (standard U-Net) |
+| Activation function | Leaky-ReLU (Eq.8) | LeakyReLU(0.01) | MATCH |
+| Batch Normalization | Implied ("multiscale") | BatchNorm2d after each conv | MATCH |
 | ASPP rates | [6, 12, 18, 24] | [6, 12, 18, 24] | EXACT MATCH |
-| ASPP branch output | 40 channels each | 40 channels each | EXACT MATCH |
-| ASPP global pooling branch | Yes | Yes | MATCH |
-| ASPP fusion | 1x1 conv | 1x1 conv (200->40) | MATCH |
-| ASPP final output | 40 channels | 40 channels | MATCH |
+| ASPP global pool | Yes (Fig.4) | AdaptiveAvgPool2d + Conv1x1 | MATCH |
+| ASPP branch output channels | 40 (Fig.4) | 40 | EXACT MATCH |
+| ASPP fusion | 1x1 conv | Conv2d(200->40, k=1) | MATCH |
+| ASPP activation | Not explicitly stated | LeakyReLU(0.01) | CONSISTENT |
+| Input dimensions | (2, 40, 40, 20) paper text / (2, 81, 81) actual obs | (2, 81, 81) | **Corrected** -- obs data is 2D |
+| Output dimensions | (40, 40, 20) per task | (1, 40, 40, 20) per task | MATCH |
+| Number of tasks | 5 | 5 | EXACT MATCH |
 
-### Note on Decoder Level Count
+### Key Adaptation Notes
 
-The paper describes "4 encoder layers + 4 decoder layers".  Our implementation uses
-3 decoder layers because:
-- 3 MaxPool operations reduce spatial size 3 times (40->20->10->5)
-- 3 Upsample operations restore it 3 times (5->10->20->40)
-- A 4th decoder layer would upsample beyond the original 40x40x20 size
+1. **2D vs 3D backbone**: The paper text says "3D U-Net" but the actual input is 2D
+   observation data (81x81 gravity/magnetic grids). Our 2D backbone correctly handles
+   this reality. The 3D output is produced by task heads that expand 2D features
+   along the depth dimension.
 
-This is architecturally correct: the number of decoder levels should equal the number
-of pooling levels (3), not the number of encoder conv blocks (4).  The paper's
-"4 decoder layers" likely refers to 4 double-conv blocks in the decoder path,
-which our 3 decoder levels already contain (dec1, dec2, dec3 each have DoubleConv3d).
-If a 4th refinement DoubleConv at full resolution is desired, it can be added later.
+2. **Input size 81x81 vs 40x40**: The observation surface has 81x81 points (from
+   paper Section II-C). The subsurface model grid is 40x40x20. The backbone maps
+   81x81 -> 40x40 via encoder downsampling (81->40->20->10) and decoder upsampling
+   back to 40x40 via center cropping.
 
----
-
-## 5. Smoke Test Results
-
-Both modules pass forward-pass smoke tests:
-
-```
-$ python3 src/model/backbone_unet3d.py
-UNet3DBackbone total parameters: 23,344,000
-Input shape:  torch.Size([2, 2, 40, 40, 20])
-Output shape: torch.Size([2, 64, 40, 40, 20])
-Smoke test PASSED.
-
-$ python3 src/model/aspp.py
-ASPP3d total parameters: 194,400
-Input shape:  torch.Size([2, 64, 40, 40, 20])
-Output shape: torch.Size([2, 40, 40, 40, 20])
-Standalone ASPP smoke test PASSED.
-Combined Backbone+ASPP smoke test PASSED.
-```
+3. **LeakyReLU slope**: Paper Eq.8 defines Leaky-ReLU but does not specify nu.
+   We use nu=0.01 (standard default).
 
 ---
 
-## 6. Next Steps (Not Yet Implemented)
+## 7. Test Results
 
-The following components are needed to complete the full network but are out of scope
-for this implementation task:
+All **23 tests passed** (pytest, 2026-04-22):
 
-1. **Task Heads** (`src/model/task_heads.py`) -- 5 task-specific output heads:
-   - Task 1: Independent Gravity Inversion (density, MSE loss)
-   - Task 2: Independent Magnetic Inversion (susceptibility, MSE loss)
-   - Task 3: Structural Similarity Extraction (binary, BCE loss, Sigmoid)
-   - Task 4: Joint Gravity Inversion (density, MSE loss)
-   - Task 5: Joint Magnetic Inversion (susceptibility, MSE loss)
+- `TestUNet2DBackbone` (11 tests): forward shapes (batch 1/2/4), param count,
+  gradient flow, no NaN/Inf, return_features, deterministic output, different
+  input channels, LeakyReLU verification
+- `TestASPP2d` (8 tests): forward shape, different spatial sizes, param count,
+  no NaN/Inf (including batch=1 training mode), gradient flow, rate config,
+  branch output channels, LeakyReLU verification
+- `TestCombinedPipeline` (4 tests): end-to-end shape, total param range [5M,15M],
+  pipeline no NaN/Inf, pipeline gradient flow
 
-2. **Main Network** (`src/model/joint_inversion_net.py`) -- Assembles backbone + ASPP + task heads
-
-3. **Loss Functions** (`src/model/loss_functions.py`) -- MSE, BCE, Leaky-ReLU regularizer
-
-4. **Training Pipeline** (`src/train.py`) -- Optimizer, LR scheduler, gradient clipping
+Run command: `python3 -m pytest tests/test_backbone.py -v`

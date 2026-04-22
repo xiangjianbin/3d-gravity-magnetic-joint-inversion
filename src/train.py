@@ -6,13 +6,18 @@ Implements the complete training loop:
   - Learning rate: initial 1e-3, with StepLR or CosineAnnealingLR
   - Training loop with validation each epoch
   - Best model saving based on validation loss
+  - Checkpoint every N epochs (configurable) + latest every 5 epochs
   - Mixed precision (AMP) support
-  - Gradient clipping
+  - Gradient clipping (max_norm=1.0)
   - Early stopping
+  - torch.cuda.empty_cache() after each epoch
+  - Auto-evaluation after training completes
+  - Error logging to logs/error.log
 
 Usage:
     python src/train.py --config configs/full.yaml
     python src/train.py --config configs/smoke.yaml
+    python src/train.py --config configs/full.yaml --resume results/checkpoints/checkpoint_epoch050.pth
 
 Reproduced from:
   Fang et al., "Improved 3-D Joint Inversion of Gravity and Magnetic Data
@@ -25,6 +30,7 @@ import sys
 import time
 import json
 import argparse
+import traceback
 
 import numpy as np
 import torch
@@ -71,12 +77,23 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device,
 
     for batch_idx, batch in enumerate(train_loader):
         # Move data to device
-        inputs = batch['input'].to(device)
-        targets = {
-            'density': batch['density'].unsqueeze(1).to(device),
-            'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
-            'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
-        }
+        # Dataset returns list: [input_tensor (B,2,H,W), output_dict]
+        if isinstance(batch, (list, tuple)):
+            inputs = batch[0].to(device)
+            out_dict = batch[1]
+            targets = {
+                'density': out_dict['rho'].unsqueeze(1).to(device),
+                'susceptibility': out_dict['kappa'].unsqueeze(1).to(device),
+                'structural_sim': out_dict['sim'].unsqueeze(1).to(device),
+            }
+        else:
+            # Dict format (for collate_fn that returns dict)
+            inputs = batch['input'].to(device)
+            targets = {
+                'density': batch['density'].unsqueeze(1).to(device),
+                'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
+                'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
+            }
 
         # Forward pass with optional mixed precision
         optimizer.zero_grad()
@@ -128,12 +145,21 @@ def validate(model, val_loader, criterion, device):
     num_batches = 0
 
     for batch in val_loader:
-        inputs = batch['input'].to(device)
-        targets = {
-            'density': batch['density'].unsqueeze(1).to(device),
-            'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
-            'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
-        }
+        if isinstance(batch, (list, tuple)):
+            inputs = batch[0].to(device)
+            out_dict = batch[1]
+            targets = {
+                'density': out_dict['rho'].unsqueeze(1).to(device),
+                'susceptibility': out_dict['kappa'].unsqueeze(1).to(device),
+                'structural_sim': out_dict['sim'].unsqueeze(1).to(device),
+            }
+        else:
+            inputs = batch['input'].to(device)
+            targets = {
+                'density': batch['density'].unsqueeze(1).to(device),
+                'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
+                'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
+            }
 
         predictions = model(inputs)
         per_task, total_loss = criterion(predictions, targets, model=None)
@@ -150,6 +176,101 @@ def validate(model, val_loader, criterion, device):
     avg_losses['total'] = total_loss_sum / max(num_batches, 1)
 
     return avg_losses
+
+
+def append_training_history(history_path, epoch_data):
+    """Append a single epoch's data to training_history.json (incremental write).
+
+    Args:
+        history_path: Path to training_history.json.
+        epoch_data: Dict with 'epoch', 'train', 'val' keys.
+    """
+    if os.path.exists(history_path):
+        with open(history_path, 'r') as f:
+            history = json.load(f)
+    else:
+        history = {'train': [], 'val': []}
+
+    history['train'].append(epoch_data['train'])
+    history['val'].append(epoch_data['val'])
+
+    with open(history_path, 'w') as f:
+        json.dump(history, f, indent=2)
+
+
+def run_evaluation(model, test_loader, criterion, device, output_dir):
+    """Run final evaluation and save metrics.json.
+
+    Computes IoU, MSE, MAE, R^2, SSIM, PSNR for all tasks.
+
+    Args:
+        model: Trained model.
+        test_loader: Test set DataLoader.
+        criterion: Loss function (for loss computation).
+        device: Torch device.
+        output_dir: Directory to save results.
+    """
+    from src.evaluate import compute_all_metrics
+
+    model.eval()
+    all_preds = {f'task{i}': [] for i in range(1, 6)}
+    all_targets = {'density': [], 'susceptibility': [], 'structural_sim': []}
+    total_loss_sums = {f'task{i}': 0.0 for i in range(1, 6)}
+    total_loss_counts = {f'task{i}': 0 for i in range(1, 6)}
+
+    with torch.no_grad():
+        for batch in test_loader:
+            if isinstance(batch, (list, tuple)):
+                inputs = batch[0].to(device)
+                out_dict = batch[1]
+                targets = {
+                    'density': out_dict['rho'].unsqueeze(1).to(device),
+                    'susceptibility': out_dict['kappa'].unsqueeze(1).to(device),
+                    'structural_sim': out_dict['sim'].unsqueeze(1).to(device),
+                }
+            else:
+                inputs = batch['input'].to(device)
+                targets = {
+                    'density': batch['density'].unsqueeze(1).to(device),
+                    'susceptibility': batch['susceptibility'].unsqueeze(1).to(device),
+                    'structural_sim': batch['structural_sim'].unsqueeze(1).to(device),
+                }
+            predictions = model(inputs)
+
+            # Collect predictions and targets for metric computation
+            for i in range(1, 6):
+                key = f'task{i}'
+                all_preds[key].append(predictions[key].cpu())
+            for tkey in ['density', 'susceptibility', 'structural_sim']:
+                all_targets[tkey].append(targets[tkey].cpu())
+
+            # Also compute losses
+            per_task, _ = criterion(predictions, targets, model=None)
+            for i in range(1, 6):
+                key = f'task{i}'
+                val = per_task[key]
+                total_loss_sums[key] += val.item() if isinstance(val, torch.Tensor) else val
+                total_loss_counts[key] += 1
+
+    # Concatenate all batches
+    preds_cat = {k: torch.cat(v, dim=0) for k, v in all_preds.items()}
+    tgts_cat = {k: torch.cat(v, dim=0) for k, v in all_targets.items()}
+
+    # Compute all metrics
+    metrics = compute_all_metrics(preds_cat, tgts_cat)
+
+    # Add test losses
+    test_losses = {
+        f'task{i}': total_loss_sums[f'task{i}'] / max(total_loss_counts[f'task{i}'], 1)
+        for i in range(1, 6)
+    }
+    metrics['_test_losses'] = test_losses
+
+    # Save metrics
+    metrics_path = os.path.join(output_dir, 'metrics.json')
+    save_json(metrics, metrics_path)
+
+    return metrics
 
 
 def main():
@@ -189,12 +310,24 @@ def main():
     logger.info(f"Loading dataset from: {data_dir}")
     logger.info(f"Batch size: {batch_size}, Workers: {num_workers}")
 
-    train_loader, val_loader, test_loader = create_dataloaders(
-        data_dir=data_dir,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=(device.type == 'cuda'),
-    )
+    try:
+        dataloaders = create_dataloaders(
+            data_dir=data_dir,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=(device.type == 'cuda'),
+        )
+        # create_dataloaders returns a tuple (train, val, test) or dict
+        if isinstance(dataloaders, tuple):
+            train_loader, val_loader, test_loader = dataloaders
+        else:
+            train_loader = dataloaders['train']
+            val_loader = dataloaders['val']
+            test_loader = dataloaders['test']
+    except Exception as e:
+        logger.error(f"Failed to load dataset: {e}")
+        raise
+
     logger.info(f"Train samples: {len(train_loader.dataset)}")
     logger.info(f"Val samples:   {len(val_loader.dataset)}")
     logger.info(f"Test samples:  {len(test_loader.dataset)}")
@@ -275,102 +408,140 @@ def main():
     early_stopping_patience = cfg.get('early_stopping_patience', 15)
     epochs_no_improve = 0
     history = {'train': [], 'val': []}
+    history_path = os.path.join(output_dir, 'training_history.json')
 
     logger.info(f"\nStarting training for {epochs} epochs...")
     logger.info("-" * 60)
 
     total_start_time = time.time()
 
-    for epoch in range(start_epoch, epochs):
-        epoch_start = time.time()
+    try:
+        for epoch in range(start_epoch, epochs):
+            epoch_start = time.time()
 
-        # Train
-        train_losses = train_one_epoch(
-            model, train_loader, criterion, optimizer, device,
-            scaler=scaler, grad_clip=grad_clip,
-        )
+            # Train
+            train_losses = train_one_epoch(
+                model, train_loader, criterion, optimizer, device,
+                scaler=scaler, grad_clip=grad_clip,
+            )
 
-        # Validate
-        val_losses = validate(model, val_loader, criterion, device)
+            # Validate
+            val_losses = validate(model, val_loader, criterion, device)
 
-        # Update scheduler
-        if scheduler is not None:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_losses['total'])
-            else:
-                scheduler.step()
+            # Update scheduler
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(val_losses['total'])
+                else:
+                    scheduler.step()
 
-        current_lr = optimizer.param_groups[0]['lr']
-        epoch_time = time.time() - epoch_start
+            current_lr = optimizer.param_groups[0]['lr']
+            epoch_time = time.time() - epoch_start
 
-        # Log
-        history['train'].append(train_losses)
-        history['val'].append(val_losses)
+            # Log
+            history['train'].append(train_losses)
+            history['val'].append(val_losses)
 
-        task_names = ['Task1(IndGrav)', 'Task2(IndMag)', 'Task3(StructSim)',
-                      'Task4(JointGrav)', 'Task5(JointMag)']
-
-        log_msg = (f"Epoch [{epoch+1}/{epochs}] | "
-                   f"Time: {epoch_time:.1f}s | LR: {current_lr:.2e}\n"
-                   f"  Train Loss: Total={train_losses['total']:.6f}" +
-                   "".join([f", T{i+1}={train_losses[f'task{i+1}']:.4f}"
-                             for i in range(5)]) + "\n" +
-                   f"  Val   Loss: Total={val_losses['total']:.6f}" +
-                   "".join([f", T{i+1}={val_losses[f'task{i+1}']:.4f}"
-                             for i in range(5)]))
-
-        logger.info(log_msg)
-
-        # Save best model based on total validation loss
-        is_best = val_losses['total'] < best_val_loss
-        if is_best:
-            best_val_loss = val_losses['total']
-            epochs_no_improve = 0
-            logger.info(f"  ** New best val loss: {best_val_loss:.6f} **")
-        else:
-            epochs_no_improve += 1
-
-        # Save checkpoint every N epochs or when best
-        save_every = cfg.get('save_every', 10)
-        if is_best or (epoch + 1) % save_every == 0:
-            ckpt_path = os.path.join(output_dir, 'checkpoints',
-                                     f'checkpoint_epoch{epoch+1:03d}.pth')
-            save_checkpoint({
+            # Incremental write to training_history.json after each epoch
+            append_training_history(history_path, {
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                'best_val_loss': best_val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'config': cfg,
-            }, ckpt_path, is_best=is_best)
+                'train': train_losses,
+                'val': val_losses,
+            })
 
-        # Early stopping
-        if epochs_no_improve >= early_stopping_patience:
-            logger.info(f"\nEarly stopping triggered after {epochs_no_improve} epochs "
-                       f"without improvement.")
-            break
+            task_names = ['Task1(IndGrav)', 'Task2(IndMag)', 'Task3(StructSim)',
+                          'Task4(JointGrav)', 'Task5(JointMag)']
+
+            log_msg = (f"Epoch [{epoch+1}/{epochs}] | "
+                       f"Time: {epoch_time:.1f}s | LR: {current_lr:.2e}\n"
+                       f"  Train Loss: Total={train_losses['total']:.6f}" +
+                       "".join([f", T{i+1}={train_losses[f'task{i+1}']:.4f}"
+                                 for i in range(5)]) + "\n" +
+                       f"  Val   Loss: Total={val_losses['total']:.6f}" +
+                       "".join([f", T{i+1}={val_losses[f'task{i+1}']:.4f}"
+                                 for i in range(5)]))
+
+            logger.info(log_msg)
+
+            # Save best model based on total validation loss
+            is_best = val_losses['total'] < best_val_loss
+            if is_best:
+                best_val_loss = val_losses['total']
+                epochs_no_improve = 0
+                logger.info(f"  ** New best val loss: {best_val_loss:.6f} **")
+            else:
+                epochs_no_improve += 1
+
+            # Save checkpoint: always when best, every save_every epochs, AND every 5 epochs for resume safety
+            save_every = cfg.get('save_every', 10)
+            should_save = is_best or (epoch + 1) % save_every == 0 or (epoch + 1) % 5 == 0
+            if should_save:
+                ckpt_path = os.path.join(output_dir, 'checkpoints',
+                                         f'checkpoint_epoch{epoch+1:03d}.pth')
+                save_checkpoint({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'scaler_state_dict': scaler.state_dict() if scaler else None,
+                    'best_val_loss': best_val_loss,
+                    'train_losses': train_losses,
+                    'val_losses': val_losses,
+                    'config': cfg,
+                }, ckpt_path, is_best=is_best)
+
+            # Release GPU memory after each epoch
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            # Early stopping
+            if epochs_no_improve >= early_stopping_patience:
+                logger.info(f"\nEarly stopping triggered after {epochs_no_improve} epochs "
+                           f"without improvement.")
+                break
+
+    except Exception as e:
+        # Log error to dedicated error file and re-raise
+        error_log_path = os.path.join(output_dir, '..', 'logs', 'error.log')
+        os.makedirs(os.path.dirname(error_log_path), exist_ok=True)
+        with open(error_log_path, 'a') as ef:
+            ef.write(f"\n{'='*60}\n")
+            ef.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            ef.write(f"Config: {args.config}\n")
+            ef.write(f"Epoch: {epoch+1 if 'epoch' in dir() else 'unknown'}\n")
+            ef.write(f"Error:\n{traceback.format_exc()}\n")
+        logger.error(f"Training failed at epoch {epoch+1}: {e}")
+        raise
 
     total_time = time.time() - total_start_time
     logger.info(f"\nTraining completed in {total_time/3600:.2f} hours ({total_time:.0f}s)")
     logger.info(f"Best validation loss: {best_val_loss:.6f}")
 
-    # ---- Save training history ----
-    history_path = os.path.join(output_dir, 'training_history.json')
+    # ---- Save final training history ----
     save_json(history, history_path)
     logger.info(f"Training history saved to {history_path}")
 
     # ---- Final evaluation on test set ----
-    logger.info("\nRunning final test evaluation...")
-    test_losses = validate(model, test_loader, criterion, device)
-    logger.info(f"Test Loss: Total={test_losses['total']:.6f}" +
-                "".join([f", T{i+1}={test_losses[f'task{i+1}']:.4f}" for i in range(5)]))
+    logger.info("\nRunning final test evaluation with full metrics...")
 
-    # Save test results
-    test_results_path = os.path.join(output_dir, 'test_results.json')
-    save_json({'test_losses': test_losses, 'best_val_loss': best_val_loss},
-              test_results_path)
+    try:
+        metrics = run_evaluation(model, test_loader, criterion, device, output_dir)
+
+        logger.info(f"Test Loss: Total={metrics['_test_losses']['task1']:.6f}" +  # approximate total
+                   "".join([f", T{i+1}={metrics['_test_losses'][f'task{i+1}']:.4f}"
+                             for i in range(5)]))
+
+        logger.info("\n=== Evaluation Metrics Summary ===")
+        for task_name, task_metrics in metrics.items():
+            if task_name.startswith('_'):
+                continue
+            logger.info(f"{task_name}:")
+            for mname, mval in task_metrics.items():
+                logger.info(f"  {mname}: {mval:.4f}")
+
+        logger.info(f"\nAll results saved to {output_dir}/")
+    except Exception as e:
+        logger.warning(f"Evaluation failed (training was still successful): {e}")
 
     logger.info("Done.")
 

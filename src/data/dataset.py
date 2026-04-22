@@ -202,7 +202,8 @@ def create_dataloaders(data_dir: str,
     info = {k: len(v.dataset) for k, v in dataloaders.items()}
     print(f"[DataLoader] train={info['train']}, val={info['val']}, "
           f"test={info['test']}, batch_size={batch_size}")
-    return dataloaders
+    # Return as tuple for easy unpacking: train_loader, val_loader, test_loader
+    return dataloaders['train'], dataloaders['val'], dataloaders['test']
 
 
 if __name__ == '__main__':
