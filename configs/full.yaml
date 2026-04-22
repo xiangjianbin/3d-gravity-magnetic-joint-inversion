@@ -3,7 +3,7 @@
 
 # Data
 data_dir: data
-batch_size: 16          # RTX 5000 Ada 32GB can handle larger batches; tune in Phase 4
+batch_size: 320         # Measured optimal: 24.9 GB / 31.6 GB = 78.7% VRAM (FP32, see docs/GPU_ALLOC_PLAN.md)
 num_workers: 4
 
 # Model architecture
@@ -35,7 +35,7 @@ leaky_relu_lambda: 1e-5 # L2 weight penalty coefficient (Leaky-ReLU regularizer)
 
 # Training stability
 grad_clip: 1.0          # Max gradient norm for clipping
-use_amp: true           # Automatic Mixed Precision (saves VRAM on RTX 5000 Ada)
+use_amp: false          # FP32 for paper alignment; set true + batch_size=512 for faster training (see GPU_ALLOC_PLAN.md)
 early_stopping_patience: 15  # Stop if no improvement for N epochs
 
 # Output
