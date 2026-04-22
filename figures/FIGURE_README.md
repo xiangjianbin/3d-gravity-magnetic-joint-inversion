@@ -1,29 +1,85 @@
-# Dataset Visualization Figures — README
+# Figures README — 重磁联合反演论文复现
 
-Each figure is saved in **SVG format** (vector graphics, scalable without quality loss).
+All figures saved in **SVG format** (vector graphics, scalable without quality loss).
 
-## Figure List
+---
+
+## Paper Figures (Fig.5 — Fig.13)
+
+Corresponding to Fang et al., IEEE TGRS Vol.63, 2025.
+
+| Filename | Paper Fig | Description | Status |
+|----------|-----------|-------------|--------|
+| `fig5_training_curves.svg` | Fig.5 | Training & validation loss curves (3 panels: gravity, magnetic, structural sim) | Generated from actual training data |
+| `fig6_base_models.svg` | Fig.6 | Base geological models: (a) cuboid, (b) tilting body, (c) random walk | Synthetic visualization |
+| `fig7_combined_models.svg` | Fig.7 | Combined models: global/partial/inconsistent consistency (3×3 panels) | Synthetic visualization |
+| `fig8_test_model.svg` | Fig.8 | Test model: density, susceptibility, gravity obs, magnetic obs | Synthetic visualization |
+| `fig9_real_data.svg` | Fig.9 | Real field data application (placeholder — Qingchuan iron deposit) | Placeholder |
+| `fig10_cross_sections.svg` | Fig.10 | Cross-section profiles of inversion results | Synthetic visualization |
+| `fig11_depth_slices.svg` | Fig.11 | Depth slice comparison at 60m and 260m (multi-method comparison) | Synthetic visualization |
+| `fig12_3d_reconstruction.svg` | Fig.12 | 3D reconstructed model isosurface visualization | Synthetic visualization |
+| `fig13_prediction_vs_observed.svg` | Fig.13 | Predicted vs observed data (gravity + magnetic fitting check) | Synthetic visualization |
+
+### Important Note on Figure Status
+
+**Training did not converge** (see `docs/RESULT_COMPARISON.md`). The paper figures above were generated
+during Phase 2-4 using synthetic/idealized data for illustration purposes. They do NOT reflect
+actual model predictions from a converged training run.
+
+For actual (untrained) model output visualizations, see `results/figures/`.
+
+---
+
+## Result Analysis Figures (Phase 7 Output)
+
+Located in `results/figures/`. These reflect the **actual training results**.
 
 | Filename | Description |
 |----------|-------------|
-| `dataset_type1_example.svg` | Type 1: Single cuboid/cube model. Depth slice of density. Subtypes: single cuboid (rectangular), single cube (near-equal dims), 2-body combo, 3-body combo. Color: viridis (purple=low, yellow=high density). |
-| `dataset_type2_example.svg` | Type 2: Single tilting body. Depth slice showing non-axis-aligned anomaly from coordinate rotation with supersampling anti-aliasing. |
-| `dataset_type3_example.svg` | Type 3: Random walk body. Irregular complex shape from 3D random walk algorithm with morphological dilation. |
-| `dataset_type4_example.svg` | Type 4: Global structural consistency. **Three panels**: Density (left), Susceptibility (middle), Structural Similarity (right). Note: density and susceptibility anomalies fully overlap; Sim ≈ 1 on body. |
-| `dataset_type5_example.svg` | Type 5: Partial structural consistency. Three panels. Some regions show co-located anomalies (Sim=1), others show single-property anomalies (Sim=0). |
-| `dataset_type6_example.svg` | Type 6: Structural inconsistency. Three panels. Density and susceptibility anomalies are spatially independent; Sim ≈ 0 everywhere. |
-| `dataset_trapezoid_examples.svg` | Trapezoid special cases: **5 panels** showing 1-section through 5-section trapezoids. Cross-sectional width varies linearly with depth. |
-| `dataset_overview.svg` | Dataset overview: **Left**: pie chart of type distribution (Types 1-6 with counts). **Right**: summary statistics table (total samples, split ratios, grid specs, property ranges, noise levels). |
+| `training_curves.svg` | Actual training/validation loss curves (flat — model didn't learn) |
+| `inversion_density_gt.svg` | Density ground truth (diagnostic) |
+| `inversion_density_pred.svg` | Density prediction (untrained model) |
+| `inversion_suscept_gt.svg` | Susceptibility ground truth (diagnostic) |
+| `inversion_suscept_pred.svg` | Susceptibility prediction (untrained model) |
+| `inversion_struct_sim_gt.svg` | Structural similarity GT (diagnostic) |
+| `inversion_struct_sim_pred.svg` | Structural similarity pred (untrained) |
+| `scatter_gt_vs_pred.svg` | Scatter plot: GT vs Prediction (all tasks + diagnosis panel) |
+| `slice_depth_comparison_density.svg` | Multi-depth slice comparison (density) |
+| `slice_depth_comparison_suscept.svg` | Multi-depth slice comparison (susceptibility) |
+| `metrics_summary.svg` | Bar chart: MSE/MAE/R²/SSIM by task |
+
+---
+
+## Dataset Figures (Phase 2 Output)
+
+| Filename | Description |
+|----------|-------------|
+| `dataset_type{1-6}_example.svg` | Example samples for each of 6 geological model types |
+| `dataset_trapezoid_examples.svg` | Trapezoid special cases (1-5 sections) |
+| `dataset_overview.svg` | Dataset overview pie chart + statistics table |
+| `dataset_6types_samples.pdf` | All 6 types in one page (PDF) |
+| `dataset_distributions.pdf` | Property value distributions (PDF) |
+| `dataset_model_examples.pdf` | Model geometry examples (PDF) |
+| `dataset_split_pie.pdf` | Train/val/test split (PDF) |
+| `dataset_structural_sim_stats.pdf` | Structural similarity statistics (PDF) |
+
+---
 
 ## Coordinate System
 
-- **X-axis**: Easting (cells 0-39, corresponding to -400m to +400m)
-- **Y-axis**: Northing (cells 0-39, corresponding to -400m to +400m)
-- **Z-axis**: Depth (cells 0-19, corresponding to 0m to 400m below surface)
-- Observation grid: 81x81 centered on model, at z = +10m above surface
+- **X-axis**: Easting (cells 0–39 → 0m to 800m)
+- **Y-axis**: Northing (cells 0–39 → 0m to 800m)
+- **Z-axis**: Depth (cells 0–19 → 0m to 400m below surface)
+- **Observation grid**: 81×81 centered on model, at z = +10m above surface
 
 ## Color Scheme
 
-- Model property maps (density, susceptibility): `viridis` colormap
-- Structural similarity: binary (0 = background or single-property, 1 = co-located anomaly)
-- Observation data (gravity, magnetic): diverging colormaps (blue = negative, red = positive)
+- Model property maps (density, susceptibility): `viridis` / `RdYlBu_r`
+- Structural similarity: `RdBu_r` (blue=0 background, red=1 co-located)
+- Observation data (gravity, magnetic): diverging colormaps (blue=negative, red=positive)
+- Training curves: task-specific colors (blue/orange/green/red/purple)
+
+---
+
+*Generated: 2026-04-22*
+*Project: Fang et al. 2025 TGRS — Gravity-Magnetic Joint Inversion Reproduction*
