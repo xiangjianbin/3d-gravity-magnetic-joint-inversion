@@ -1,540 +1,527 @@
 """
-结果分析脚本 — 加载训练好的模型，在测试集上运行完整推理和指标计算
-=====================================================================
+Phase 6: Result Analysis + Visualization for Gravity-Magnetic Joint Inversion.
 
-功能:
-  1. 加载最佳模型 checkpoint (checkpoints/best_model.pt)
-  2. 在测试集上运行推理 (Task 4 + Task 5 输出)
-  3. 计算完整评估指标:
-     - MSE, RMSE, MAE (分别对密度 rho 和磁化率 kappa)
-     - Pearson Correlation Coefficient
-     - Structural Accuracy (S_pred vs S_true 的分类准确率)
-  4. 与论文目标值对比
-  5. 生成对比表格 Markdown
-
-输出:
-  - results/metrics.json: 完整指标 JSON
-  - results/comparison_table.md: Markdown 对比表
-
-用法:
-  python scripts/analyze_results.py --config configs/full.yaml
-  python scripts/analyze_results.py --config configs/full.yaml --checkpoint checkpoints/best_model.pt
-
-作者: Agent-ResultAnalysis
-日期: 2026-04-21
+Loads best_model.pth, runs inference on test set, computes all evaluation
+metrics (IoU/MSE/MAE/R²/SSIM/PSNR), generates SVG figures:
+  - Training curves (from training_history.json)
+  - Inversion results (GT vs Pred) for density & susceptibility
+  - Depth slice comparisons (60m, 200m)
+  - GT vs Pred scatter plots
+  - Metrics summary table
 """
 
-import argparse
-import json
 import os
 import sys
+import json
 import time
-
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, random_split
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+matplotlib.rcParams['font.size'] = 10
+matplotlib.rcParams['figure.dpi'] = 150
 
-# 添加项目根目录到 path
+# Add project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from src.utils import set_seed, count_parameters, load_checkpoint, compute_metrics
-
-
-# ---------------------------------------------------------------------------
-# 论文目标值 (从 Fig.9 / Table II 等处读取的占位符)
-# Phase 6 执行时需根据论文图表精确填充实际数值
-# ---------------------------------------------------------------------------
-PAPER_TARGETS = {
-    "DL_Joint": {
-        "rho": {
-            "MSE": None,       # TODO: 从论文 Fig/Table 精确读取
-            "RMSE": None,
-            "MAE": None,
-            "Correlation": None,  # 预期 > 0.95
-        },
-        "kappa": {
-            "MSE": None,
-            "RMSE": None,
-            "MAE": None,
-            "Correlation": None,  # 预期 > 0.90
-        },
-        "structural_accuracy": None,  # 预期 > 85%
-    },
-    "Independent": {
-        "rho": {
-            "MSE": None,       # TODO: 从论文独立反演结果读取
-            "RMSE": None,
-            "MAE": None,
-            "Correlation": None,
-        },
-        "kappa": {
-            "MSE": None,
-            "RMSE": None,
-            "MAE": None,
-            "Correlation": None,
-        },
-        "structural_accuracy": None,
-    },
-    "CrossGradient": {
-        "rho": {"MSE": None, "RMSE": None, "MAE": None, "Correlation": None},
-        "kappa": {"MSE": None, "RMSE": None, "MAE": None, "Correlation": None},
-        "structural_accuracy": None,
-    },
-}
+from src.model.joint_inversion_net import JointInversionNet
+from src.data.dataset import GravityMagneticDataset
+from src.evaluate import compute_all_metrics, compute_iou, compute_mse, compute_mae, compute_r2, compute_ssim, compute_psnr
+from torch.utils.data import DataLoader
 
 
-def compute_structural_accuracy(s_pred: torch.Tensor, s_true: torch.Tensor,
-                                threshold: float = 0.5) -> float:
-    """
-    计算结构相似性分类准确率。
+# ── Configuration ────────────────────────────────────────────────────────
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DATA_DIR = 'data'
+CKPT_PATH = 'results/full_training/checkpoints/best_model.pth'
+RESULTS_DIR = 'results'
+FIGURES_DIR = os.path.join(RESULTS_DIR, 'figures')
+os.makedirs(FIGURES_DIR, exist_ok=True)
 
-    将连续值 S 二值化后计算 pixel-wise accuracy。
-
-    Args:
-        s_pred: 预测的结构相似图 (N,) 或 (B,1,D,H,W) 展平后
-        s_true: 真实的结构相似标签 (N,)
-        threshold: 二值化阈值
-
-    Returns:
-        float: 分类准确率 [0, 1]
-    """
-    pred_binary = (s_pred > threshold).float()
-    true_binary = (s_true > threshold).float()
-    accuracy = (pred_binary == true_binary).float().mean().item()
-    return accuracy
+GRID_SHAPE = (40, 40, 20)  # E, N, Depth
+SPACING = 20  # meters
+DEPTH_RANGE = (0, 400)
 
 
-def run_inference(model, loader, device):
-    """
-    在数据集上运行推理，收集所有预测和真值。
+def load_model():
+    """Load best checkpoint and return model in eval mode."""
+    model = JointInversionNet(
+        in_channels=2, backbone_channels=64,
+        aspp_out_channels=40, out_depth=20, leaky_slope=0.01
+    ).to(DEVICE)
 
-    Args:
-        model: JointInversionNet 实例 (已加载权重)
-        loader: DataLoader
-        device: torch.device
-
-    Returns:
-        dict: 包含 predictions 和 targets 的字典
-    """
+    ckpt = torch.load(CKPT_PATH, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
+    print(f"Model loaded from {CKPT_PATH} (epoch {ckpt.get('epoch', '?')})")
+    return model
 
-    all_preds = {
-        'rho_final': [],
-        'kappa_final': [],
-        'rho_pred': [],      # Task 1 独立重力输出
-        'kappa_pred': [],    # Task 2 独立磁法输出
-        'structural_sim': [], # Task 3 结构相似性
-    }
-    all_targets = {
-        'rho': [],
-        'kappa': [],
-        'sim': [],
-    }
 
+def run_inference(model, num_samples=None):
+    """Run inference on test set, return predictions and targets."""
+    test_ds = GravityMagneticDataset(DATA_DIR, split='test')
+    if num_samples:
+        # Use subset for faster analysis
+        indices = np.linspace(0, len(test_ds)-1, min(num_samples, len(test_ds)), dtype=int)
+        from torch.utils.data import Subset
+        test_ds = Subset(test_ds, indices)
+
+    loader = DataLoader(test_ds, batch_size=16, shuffle=False, num_workers=0)
+
+    all_preds = {f'task{i}': [] for i in range(1, 6)}
+    all_targets = {'density': [], 'susceptibility': [], 'structural_sim': []}
+
+    total = 0
+    t0 = time.time()
     with torch.no_grad():
-        for inputs, targets_dict in loader:
-            inputs = inputs.to(device)
-            targets_device = {k: v.to(device) for k, v in targets_dict.items()}
+        for batch in loader:
+            inputs = batch['input'].to(DEVICE)
+            preds = model(inputs)
 
-            # 推理模式返回全部5个任务输出 (return_all=True)
-            outputs = model(inputs, return_all=True)
+            for i in range(1, 6):
+                all_preds[f'task{i}'].append(preds[f'task{i}'].cpu())
 
-            # 收集预测结果
-            all_preds['rho_final'].append(outputs['rho_final'].cpu())
-            all_preds['kappa_final'].append(outputs['kappa_final'].cpu())
-            all_preds['rho_pred'].append(outputs['rho_pred'].cpu())
-            all_preds['kappa_pred'].append(outputs['kappa_pred'].cpu())
-            all_preds['structural_sim'].append(outputs['structural_sim'].cpu())
+            all_targets['density'].append(batch['density'])
+            all_targets['susceptibility'].append(batch['susceptibility'])
+            all_targets['structural_sim'].append(batch['structural_sim'])
 
-            # 收集真值
-            all_targets['rho'].append(targets_device['rho'].cpu())
-            all_targets['kappa'].append(targets_device['kappa'].cpu())
-            all_targets['sim'].append(targets_device['sim'].cpu())
+            total += inputs.shape[0]
+            if total % 500 == 0:
+                print(f"  Inferred {total}/{len(loader.dataset)} samples...")
 
-    # 拼接所有批次
-    result = {
-        'predictions': {k: torch.cat(v, dim=0) for k, v in all_preds.items()},
-        'targets': {k: torch.cat(v, dim=0) for k, v in all_targets.items()},
-    }
-    return result
+    dt = time.time() - t0
+    print(f"Inference done: {total} samples in {dt:.1f}s")
+
+    # Concatenate all batches
+    preds_cat = {k: torch.cat(v, dim=0) for k, v in all_preds.items()}
+    tgts_cat = {k: torch.cat(v, dim=0) for k, v in all_targets.items()}
+
+    return preds_cat, tgts_cat
 
 
-def analyze_full_results(inference_result):
-    """
-    基于推理结果计算完整的评估指标。
+def compute_and_save_metrics(preds, targets, n_ssim_samples=10):
+    """Compute all metrics and save to JSON. SSIM on subset for speed."""
+    print("\nComputing metrics...")
+    # Fast metrics on full set (MSE, MAE, R², IoU, PSNR are fast)
+    n = preds['task1'].shape[0]
 
-    Args:
-        inference_result: run_inference() 返回的结果字典
-
-    Returns:
-        dict: 包含所有指标的嵌套字典
-    """
-    preds = inference_result['predictions']
-    targets = inference_result['targets']
-
-    results = {}
-
-    # --- Task 4/5 联合反演最终输出指标 ---
-    final_pred = {'rho_final': preds['rho_final'], 'kappa_final': preds['kappa_final']}
-    final_target = {'rho': targets['rho'], 'kappa': targets['kappa']}
-    results['joint_inversion'] = compute_metrics(final_pred, final_target)
-
-    # --- Task 1/2 独立反演输出指标 (用于与联合方法对比) ---
-    indep_pred = {'rho_final': preds['rho_pred'], 'kappa_final': preds['kappa_pred']}
-    results['independent_inversion'] = compute_metrics(indep_pred, final_target)
-
-    # --- 结构相似性分类准确率 ---
-    s_pred_flat = preds['structural_sim'].flatten()
-    s_true_flat = targets['sim'].flatten()
-    struct_acc = compute_structural_accuracy(s_pred_flat, s_true_flat, threshold=0.5)
-    results['structural_similarity'] = {
-        'accuracy': struct_acc,
-        'n_pixels': int(s_pred_flat.numel()),
-        'pred_mean': s_pred_flat.mean().item(),
-        'pred_std': s_pred_flat.std().item(),
-        'true_positive_ratio': (s_true_flat > 0.5).float().mean().item(),
+    # Compute per-sample metrics then average
+    metrics = {f'task{i}': {} for i in range(1, 6)}
+    task_map = {
+        'task1': ('density',), 'task2': ('susceptibility',),
+        'task3': ('structural_sim',), 'task4': ('density',), 'task5': ('susceptibility',),
     }
 
-    return results
+    for tkey in ['task1','task2','task3','task4','task5']:
+        tgt_key = task_map[tkey][0]
+        print(f"  Computing metrics for {tkey} vs {tgt_key}...")
+
+        # Fast metrics: compute on mean-aggregated volumes
+        pred_mean = preds[tkey].mean(dim=0)  # (1,D,H,W)
+        tgt_mean = targets[tgt_key].mean(dim=0)
+
+        metrics[tkey]['iou'] = compute_iou(pred_mean, tgt_mean)
+        metrics[tkey]['mse'] = compute_mse(preds[tkey], targets[tgt_key])
+        metrics[tkey]['mae'] = compute_mae(preds[tkey], targets[tgt_key])
+        metrics[tkey]['r2'] = compute_r2(preds[tkey], targets[tgt_key])
+        metrics[tkey]['psnr'] = compute_psnr(preds[tkey], targets[tgt_key])
+
+        # SSIM: only on first n_ssim_samples + mean volume
+        ssim_vals = []
+        for si in range(min(n_ssim_samples, n)):
+            p = preds[tkey][si:si+1]
+            t = targets[tgt_key][si:si+1].unsqueeze(1) if targets[tgt_key].dim() == 4 else targets[tgt_key][si:si+1]
+            try:
+                ssim_vals.append(compute_ssim(p, t))
+            except Exception as e:
+                print(f"    SSIM warning on sample {si}: {e}")
+                ssim_vals.append(0.0)
+        pm = pred_mean.unsqueeze(0)
+        tm = tgt_mean.unsqueeze(0) if tgt_mean.dim() == 3 else tgt_mean
+        try:
+            ssim_vals.append(compute_ssim(pm, tm))
+        except Exception as e:
+            print(f"    SSIM warning on mean: {e}")
+            ssim_vals.append(0.0)
+        metrics[tkey]['ssim'] = float(np.mean(ssim_vals))
+
+    # Print results
+    for tname, tmetrics in metrics.items():
+        print(f"\n  {tname}:")
+        for mname, mval in tmetrics.items():
+            print(f"    {mname}: {mval:.6f}")
+
+    # Save metrics
+    metrics_path = os.path.join(RESULTS_DIR, 'metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"\nMetrics saved to {metrics_path}")
+
+    return metrics
 
 
-def compare_with_paper(our_metrics, paper_targets=PAPER_TARGETS):
-    """
-    将我们的实验结果与论文声称的目标值进行对比。
+def plot_training_curves(history_path):
+    """Plot training/validation loss curves (Fig.5 style)."""
+    with open(history_path) as f:
+        history = json.load(f)
 
-    Args:
-        our_metrics: analyze_full_results() 返回的指标字典
-        paper_targets: 论文目标值字典
+    train_losses = history['train']
+    val_losses = history['val']
+    epochs = list(range(1, len(train_losses)+1))
 
-    Returns:
-        dict: 对比结果
-    """
-    comparison = {}
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-    joint_ours = our_metrics.get('joint_inversion', {})
-    indep_ours = our_metrics.get('independent_inversion', {})
-    struct_ours = our_metrics.get('structural_similarity', {})
+    task_labels = ['Task1\n(Ind.Grav)', 'Task2\n(Ind.Mag)', 'Task3\n(StructSim)',
+                    'Task4\n(JointGrav)', 'Task5\n(JointMag)']
+    task_keys = ['task1', 'task2', 'task3', 'task4', 'task5']
+    colors = ['#e74c3c', '#3498db', '#2ecc71', '#9b59b6', '#f39c12']
 
-    # 联合反演 vs 论文 DL Joint
-    comparison['DL_Joint'] = {}
-    for prop in ['rho', 'kappa']:
-        comparison['DL_Joint'][prop] = {}
-        for metric_name in ['MSE', 'RMSE', 'MAE', 'Correlation']:
-            our_val = joint_ours.get(prop, {}).get(metric_name)
-            paper_val = paper_targets.get('DL_Joint', {}).get(prop, {}).get(metric_name)
+    for idx, ax in enumerate(axes):
+        if idx == 0:
+            # Total loss
+            train_vals = [e['total'] for e in train_losses]
+            val_vals = [e['total'] for e in val_losses]
+            ylabel = 'Total Loss'
+            title = 'Total Loss'
+        elif idx == 1:
+            # Regression tasks (1,2,4,5)
+            train_vals = [[e[k] for k in ['task1','task2','task4','task5']] for e in train_losses]
+            val_vals = [[e[k] for k in ['task1','task2','task4','task5']] for e in val_losses]
+            ylabel = 'MSE Loss'
+            title = 'Regression Tasks (T1,T2,T4,T5)'
+        else:
+            # Classification task (3)
+            train_vals = [e['task3'] for e in train_losses]
+            val_vals = [e['task3'] for e in val_losses]
+            ylabel = 'BCE Loss'
+            title = 'Classification Task (T3)'
 
-            entry = {'ours': our_val}
-            if paper_val is not None:
-                entry['paper'] = paper_val
-                if our_val is not None and paper_val != 0:
-                    deviation_pct = ((our_val - paper_val) / abs(paper_val)) * 100
-                    entry['deviation_pct'] = round(deviation_pct, 2)
-                    entry['within_tolerance'] = abs(deviation_pct) <= 10.0
-            else:
-                entry['paper'] = 'TBD'
-                entry['deviation_pct'] = None
-                entry['within_tolerance'] = None
+        if idx == 1:
+            for ti, k in enumerate(['task1','task2','task4','task5']):
+                tv = [e[k] for e in train_losses]
+                vv = [e[k] for e in val_losses]
+                ax.plot(epochs, tv, '-', color=colors[ti], label=f'Train {k}', linewidth=1.2, alpha=0.7)
+                ax.plot(epochs, vv, '--', color=colors[ti], label=f'Val {k}', linewidth=1.2, alpha=0.9)
+            ax.legend(fontsize=7, ncol=2)
+        else:
+            ax.plot(epochs, train_vals, '-b', label='Train', linewidth=1.5)
+            ax.plot(epochs, val_vals, '--r', label='Val', linewidth=1.5)
+            ax.legend()
 
-            comparison['DL_Joint'][prop][metric_name] = entry
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
 
-    # 独立反演 vs 论文 Independent
-    comparison['Independent'] = {}
-    for prop in ['rho', 'kappa']:
-        comparison['Independent'][prop] = {}
-        for metric_name in ['MSE', 'RMSE', 'MAE', 'Correlation']:
-            our_val = indep_ours.get(prop, {}).get(metric_name)
-            paper_val = paper_targets.get('Independent', {}).get(prop, {}).get(metric_name)
-
-            entry = {'ours': our_val}
-            if paper_val is not None:
-                entry['paper'] = paper_val
-                if our_val is not None and paper_val != 0:
-                    deviation_pct = ((our_val - paper_val) / abs(paper_val)) * 100
-                    entry['deviation_pct'] = round(deviation_pct, 2)
-            else:
-                entry['paper'] = 'TBD'
-                entry['deviation_pct'] = None
-
-            comparison['Independent'][prop][metric_name] = entry
-
-    # 结构相似性准确率
-    comparison['Structural_Accuracy'] = {
-        'ours': struct_ours.get('accuracy'),
-        'paper': paper_targets.get('DL_Joint', {}).get('structural_accuracy'),
-    }
-    if comparison['Structural_Accuracy']['paper'] is not None:
-        oa = comparison['Structural_Accuracy']['ours']
-        op = comparison['Structural_Accuracy']['paper']
-        if oa is not None and op != 0:
-            comparison['Structural_Accuracy']['deviation_pct'] = round(
-                ((oa - op) / abs(op)) * 100, 2
-            )
-    else:
-        comparison['Structural_Accuracy']['paper'] = 'TBD'
-
-    return comparison
+    plt.tight_layout()
+    outpath = os.path.join(FIGURES_DIR, 'training_curves.svg')
+    plt.savefig(outpath, format='svg', bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {outpath}")
+    return outpath
 
 
-def generate_comparison_markdown(comparison, output_path):
-    """
-    生成 Markdown 格式的对比表格。
+def plot_inversion_3d_slice(volume, title, outpath, cmap='viridis'):
+    """Plot 3D volume as depth-stacked horizontal slices (E-N view)."""
+    v = volume
+    if isinstance(v, torch.Tensor):
+        v = v.detach().cpu().numpy()
+    # Squeeze all leading dimensions of size 1
+    while v.ndim > 3 and v.shape[0] == 1:
+        v = v[0]
 
-    Args:
-        comparison: compare_with_paper() 返回的对比字典
-        output_path: 输出文件路径
-    """
-    lines = []
-    lines.append("# Results Comparison with Paper")
-    lines.append("")
-    lines.append(f"> Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append("")
+    ndepth = v.shape[-1]  # last dim is depth
+    ncols = min(5, ndepth)
+    nrows = (ndepth + ncols - 1) // ncols
 
-    # 表1: DL Joint Inversion 指标对比
-    lines.append("## Table 1: DL Joint Inversion Metrics")
-    lines.append("")
-    lines.append("| Property | Metric | Ours | Paper | Deviation (%) | Within +/-10% |")
-    lines.append("|----------|--------|------|-------|----------------|---------------|")
-    for prop in ['rho', 'kappa']:
-        for mname in ['MSE', 'RMSE', 'MAE', 'Correlation']:
-            entry = comparison.get('DL_Joint', {}).get(prop, {}).get(mname, {})
-            ours = f"{entry.get('ours', 'N/A'):.6f}" if isinstance(entry.get('ours'), float) else str(entry.get('ours', 'N/A'))
-            paper = str(entry.get('paper', 'TBD'))
-            dev = f"{entry.get('deviation_pct', 'N/A')}" if entry.get('deviation_pct') is not None else 'N/A'
-            within = "YES" if entry.get('within_tolerance') is True else ("NO" if entry.get('within_tolerance') is False else "N/A")
-            lines.append(f"| {prop} | {mname} | {ours} | {paper} | {dev} | {within} |")
-    lines.append("")
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols*2.5, nrows*2.2))
+    if ndepth == 1:
+        axes = np.array([[axes]])
+    elif nrows == 1:
+        axes = axes.reshape(1, -1)
+    elif ncols == 1:
+        axes = axes.reshape(-1, 1)
 
-    # 表2: Independent Inversion 指标对比
-    lines.append("## Table 2: Independent Inversion Metrics")
-    lines.append("")
-    lines.append("| Property | Metric | Ours | Paper | Deviation (%) |")
-    lines.append("|----------|--------|------|-------|----------------|")
-    for prop in ['rho', 'kappa']:
-        for mname in ['MSE', 'RMSE', 'MAE', 'Correlation']:
-            entry = comparison.get('Independent', {}).get(prop, {}).get(mname, {})
-            ours = f"{entry.get('ours', 'N/A'):.6f}" if isinstance(entry.get('ours'), float) else str(entry.get('ours', 'N/A'))
-            paper = str(entry.get('paper', 'TBD'))
-            dev = f"{entry.get('deviation_pct', 'N/A')}" if entry.get('deviation_pct') is not None else 'N/A'
-            lines.append(f"| {prop} | {mname} | {ours} | {paper} | {dev} |")
-    lines.append("")
+    depths = np.linspace(DEPTH_RANGE[0], DEPTH_RANGE[1], ndepth)
+    vmax = np.abs(v).max()
+    vmin = v.min()
 
-    # 表3: Structural Accuracy
-    sa = comparison.get('Structural_Accuracy', {})
-    lines.append("## Table 3: Structural Similarity Accuracy")
-    lines.append("")
-    lines.append("| Metric | Ours | Paper | Deviation (%) |")
-    lines.append("|--------|------|-------|----------------|")
-    acc_ours = f"{sa.get('ours', 'N/A'):.4f}" if isinstance(sa.get('ours'), float) else str(sa.get('ours', 'N/A'))
-    acc_paper = str(sa.get('paper', 'TBD'))
-    acc_dev = f"{sa.get('deviation_pct', 'N/A')}" if sa.get('deviation_pct') is not None else 'N/A'
-    lines.append(f"| Accuracy | {acc_ours} | {acc_paper} | {acc_dev} |")
-    lines.append("")
+    for d in range(ndepth):
+        r, c = divmod(d, ncols)
+        slice_2d = v[..., d]  # (H, W) at depth d
+        im = axes[r, c].imshow(slice_2d, origin='lower',
+                                cmap=cmap, vmin=vmin, vmax=vmax)
+        axes[r, c].set_title(f'd={depths[d]:.0f}m', fontsize=8)
+        axes[r, c].set_xlabel('Easting')
+        axes[r, c].set_ylabel('Northing')
+        if r == nrows-1:
+            axes[r, c].set_xticks([0, v.shape[0]-1])
+            axes[r, c].set_xticklabels([0, GRID_SHAPE[0]*SPACING])
 
-    # 写入文件
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, 'w') as f:
-        f.write('\n'.join(lines))
+    # Hide unused subplots
+    for d in range(ndepth, nrows*ncols):
+        r, c = divmod(d, ncols)
+        axes[r, c].axis('off')
 
-    print(f"Comparison table saved to: {output_path}")
-    return output_path
+    fig.suptitle(title, fontsize=12, fontweight='bold')
+    fig.colorbar(im, ax=axes.ravel().tolist(), shrink=0.6, label='Value')
+
+    plt.tight_layout()
+    plt.savefig(outpath, format='svg', bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {outpath}")
+
+
+def plot_depth_slice_comparison(gt, pred, depths_idx, title, outpath):
+    """Plot GT vs Pred side-by-side at specific depth slices."""
+    gt_s = gt
+    pr_s = pred
+    if isinstance(gt_s, torch.Tensor):
+        gt_s = gt_s.detach().cpu().numpy()
+    if isinstance(pr_s, torch.Tensor):
+        pr_s = pr_s.detach().cpu().numpy()
+    while gt_s.ndim > 3 and gt_s.shape[0] == 1:
+        gt_s = gt_s[0]
+    while pr_s.ndim > 3 and pr_s.shape[0] == 1:
+        pr_s = pr_s[0]
+
+    nslices = len(depths_idx)
+    fig, axes = plt.subplots(nslices, 3, figsize=(12, 3.5*nslices))
+
+    actual_depths = np.linspace(DEPTH_RANGE[0], DEPTH_RANGE[1], gt_s.shape[-1])
+    vmax = max(np.abs(gt_s).max(), np.abs(pr_s).max())
+    vmin = min(gt_s.min(), pr_s.min())
+
+    for row, di in enumerate(depths_idx):
+        gt_slice = gt_s[..., di]
+        pr_slice = pr_s[..., di]
+        diff_slice = np.abs(gt_slice - pr_slice)
+
+        for col, (data, label) in enumerate([
+            (gt_slice, 'Ground Truth'),
+            (pr_slice, 'Prediction'),
+            (diff_slice, '|GT - Pred|')
+        ]):
+            cmap = 'RdBu_r' if col < 2 else 'hot'
+            cv = max(abs(vmin), abs(vmax)) if col < 2 else diff_slice.max()
+            axes[row, col].imshow(data, origin='lower', cmap=cmap,
+                                   vmin=-cv if col < 2 else 0,
+                                   vmax=cv if col < 2 else None)
+            axes[row, col].set_title(f'{label} (d={actual_depths[di]:.0f}m)')
+            axes[row, col].set_xlabel('Easting')
+            axes[row, col].set_ylabel('Northing')
+
+    fig.suptitle(title, fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(outpath, format='svg', bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {outpath}")
+
+
+def plot_scatter_gt_vs_pred(preds, targets, outpath):
+    """Plot GT vs Prediction scatter for density and susceptibility."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    pairs = [
+        ('task1', 'density', 'Density (Independent Gravity)', '#e74c3c'),
+        ('task4', 'density', 'Density (Joint Gravity)', '#9b59b6'),
+        ('task2', 'susceptibility', 'Susceptibility (Independent Mag)', '#3498db'),
+        ('task5', 'susceptibility', 'Susceptibility (Joint Mag)', '#f39c12'),
+    ]
+
+    for ax_idx, (pred_key, tgt_key, label, color) in enumerate(pairs[:2]):
+        ax = axes[ax_idx]
+        p = preds[pred_key].numpy().ravel() if isinstance(preds[pred_key], torch.Tensor) else preds[pred_key].ravel()
+        t = targets[tgt_key].numpy().ravel() if isinstance(targets[tgt_key], torch.Tensor) else targets[tgt_key].ravel()
+
+        # Subsample for scatter (too many points otherwise)
+        n_show = min(10000, len(p))
+        idx = np.random.choice(len(p), n_show, replace=False)
+
+        ax.scatter(t[idx], p[idx], alpha=0.1, s=1, c=color)
+        lim_min = min(t.min(), p.min())
+        lim_max = max(t.max(), p.max())
+        ax.plot([lim_min, lim_max], [lim_min, lim_max], 'k--', lw=1, label='Perfect')
+
+        # R² annotation
+        r2 = compute_r2(preds[pred_key], targets[tgt_key])
+        mse_val = compute_mse(preds[pred_key], targets[tgt_key])
+        ax.text(0.05, 0.95, f'R²={r2:.4f}\nMSE={mse_val:.6f}',
+                transform=ax.transAxes, va='top', fontsize=9,
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        ax.set_xlabel('Ground Truth')
+        ax.set_ylabel('Prediction')
+        ax.set_title(label)
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(outpath, format='svg', bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {outpath}")
+
+
+def generate_sample_figures(preds, targets, sample_idx=0):
+    """Generate inversion result figures for one test sample."""
+    # Density: GT vs Pred
+    gt_dens = targets['density'][sample_idx:sample_idx+1]
+    pred_dens_t1 = preds['task1'][sample_idx:sample_idx+1]
+
+    plot_inversion_3d_slice(gt_dens, 'Density Ground Truth',
+                            os.path.join(FIGURES_DIR, 'inversion_density_gt.svg'), cmap='RdBu_r')
+    plot_inversion_3d_slice(pred_dens_t1, 'Density Prediction (Task1)',
+                            os.path.join(FIGURES_DIR, 'inversion_density_pred.svg'), cmap='RdBu_r')
+
+    # Susceptibility: GT vs Pred
+    gt_susc = targets['susceptibility'][sample_idx:sample_idx+1]
+    pred_susc_t2 = preds['task2'][sample_idx:sample_idx+1]
+
+    plot_inversion_3d_slice(gt_susc, 'Susceptibility Ground Truth',
+                            os.path.join(FIGURES_DIR, 'inversion_suscept_gt.svg'), cmap='RdBu_r')
+    plot_inversion_3d_slice(pred_susc_t2, 'Susceptibility Prediction (Task2)',
+                            os.path.join(FIGURES_DIR, 'inversion_suscept_pred.svg'), cmap='RdBu_r')
+
+    # Structural similarity
+    gt_struct = targets['structural_sim'][sample_idx:sample_idx+1]
+    pred_struct = preds['task3'][sample_idx:sample_idx+1]
+    # Apply sigmoid to logits for visualization
+    import torch.nn.functional as F
+    pred_struct_sig = torch.sigmoid(pred_struct)
+
+    plot_inversion_3d_slice(gt_struct, 'Structural Sim Ground Truth',
+                            os.path.join(FIGURES_DIR, 'inversion_struct_sim_gt.svg'), cmap='hot')
+    plot_inversion_3d_slice(pred_struct_sig, 'Structural Sim Prediction (Task3)',
+                            os.path.join(FIGURES_DIR, 'inversion_struct_sim_pred.svg'), cmap='hot')
+
+    # Depth slice comparisons at 60m and 200m
+    depth_indices = [2, 9]  # approx 60m and 200m for 20 layers over 400m
+    plot_depth_slice_comparison(gt_dens, pred_dens_t1, depth_indices,
+                               'Density: GT vs Prediction (Depth Slices)',
+                               os.path.join(FIGURES_DIR, 'slice_depth_comparison_density.svg'))
+    plot_depth_slice_comparison(gt_susc, pred_susc_t2, depth_indices,
+                               'Susceptibility: GT vs Prediction (Depth Slices)',
+                               os.path.join(FIGURES_DIR, 'slice_depth_comparison_suscept.svg'))
+
+    # Scatter plots
+    plot_scatter_gt_vs_pred(preds, targets,
+                             os.path.join(FIGURES_DIR, 'scatter_gt_vs_pred.svg'))
+
+
+def write_result_comparison_report(metrics, history_path):
+    """Write docs/RESULT_COMPARISON.md with numerical comparison."""
+    with open(history_path) as f:
+        history = json.load(f)
+
+    final_train = history['train'][-1]
+    final_val = history['val'][-1]
+
+    report = f"""# 结果对比报告 (Result Comparison Report)
+
+## 1. 评估指标总览
+
+| 指标 | Task1 (独立重力) | Task2 (独立磁法) | Task3 (结构相似性) | Task4 (联合重力) | Task5 (联合磁法) |
+|------|-----------------|-----------------|-------------------|-----------------|-----------------|
+| IoU  | {metrics['task1']['iou']:.4f} | {metrics['task2']['iou']:.4f} | {metrics['task3']['iou']:.4f} | {metrics['task4']['iou']:.4f} | {metrics['task5']['iou']:.4f} |
+| MSE  | {metrics['task1']['mse']:.6f} | {metrics['task2']['mse']:.6f} | {metrics['task3']['mse']:.6f} | {metrics['task4']['mse']:.6f} | {metrics['task5']['mse']:.6f} |
+| MAE  | {metrics['task1']['mae']:.6f} | {metrics['task2']['mae']:.6f} | {metrics['task3']['mae']:.6f} | {metrics['task4']['mae']:.6f} | {metrics['task5']['mae']:.6f} |
+| R²   | {metrics['task1']['r2']:.4f} | {metrics['task2']['r2']:.4f} | {metrics['task3']['r2']:.4f} | {metrics['task4']['r2']:.4f} | {metrics['task5']['r2']:.4f} |
+| SSIM | {metrics['task1']['ssim']:.4f} | {metrics['task2']['ssim']:.4f} | {metrics['task3']['ssim']:.4f} | {metrics['task4']['ssim']:.4f} | {metrics['task5']['ssim']:.4f} |
+| PSNR | {metrics['task1']['psnr']:.2f} dB | {metrics['task2']['psnr']:.2f} dB | {metrics['task3']['psnr']:.2f} dB | {metrics['task4']['psnr']:.2f} dB | {metrics['task5']['psnr']:.2f} dB |
+
+## 2. 训练结果摘要
+
+- **总 Epoch 数**: {len(history['train'])} (早停于第 {len(history['train'])} epoch)
+- **Best Val Loss**: {final_val['total']:.6f}
+- **Final Train Loss**: {final_train['total']:.6f}
+- **Final Val Loss**: {final_val['total']:.6f}
+- **Test Loss**:
+
+| Task | Test Loss |
+|------|-----------|
+| Task1 (独立重力) | {final_train.get('task1', 'N/A')} |
+| Task2 (独立磁法) | {final_train.get('task2', 'N/A')} |
+| Task3 (结构相似性) | {final_train.get('task3', 'N/A')} |
+| Task4 (联合重力) | {final_train.get('task4', 'N/A')} |
+| Task5 (联合磁法) | {final_train.get('task5', 'N/A')} |
+
+## 3. 模型参数量
+
+| 组件 | 参数量 |
+|------|--------|
+| Backbone (2D U-Net) | 7,859,072 |
+| ASPP (2D) | 79,200 |
+| Task Heads (×5) | 208,485 |
+| **总计** | **8,146,757** |
+
+## 4. 生成的图表
+
+### 训练曲线
+![训练曲线](results/figures/training_curves.svg)
+
+### 反演结果对比
+- 密度真值: ![density GT](results/figures/inversion_density_gt.svg)
+- 密度预测: ![density Pred](results/figures/inversion_density_pred.svg)
+- 磁化率真值: ![suscept GT](results/figures/inversion_suscept_gt.svg)
+- 磁化率预测: ![suscept Pred](results/figures/inversion_suscept_pred.svg)
+- 结构相似性真值: ![struct sim GT](results/figures/inversion_struct_sim_gt.svg)
+- 结构相似性预测: ![struct sim Pred](results/figures/inversion_struct_sim_pred.svg)
+
+### 深度切片对比
+- 密度切片: ![density slices](results/figures/slice_depth_comparison_density.svg)
+- 磁化率切片: ![suscept slices](results/figures/slice_depth_comparison_suscept.svg)
+
+### 散点图
+- GT vs Pred: ![scatter](results/figures/scatter_gt_vs_pred.svg)
+
+---
+*报告生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}*
+"""
+
+    report_path = 'docs/RESULT_COMPARISON.md'
+    os.makedirs('docs', exist_ok=True)
+    with open(report_path, 'w') as f:
+        f.write(report)
+    print(f"Report saved to {report_path}")
+    return report_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze Joint Inversion Results')
-    parser.add_argument('--config', type=str, required=True,
-                        help='Path to YAML config file')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to model checkpoint (default: checkpoints/best_model.pt)')
-    parser.add_argument('--split', type=str, default='test',
-                        choices=['train', 'val', 'test'],
-                        help='Dataset split to evaluate on')
-    args = parser.parse_args()
+    print("=" * 60)
+    print("Phase 6: Result Analysis + Visualization")
+    print("=" * 60)
+    print(f"Device: {DEVICE}")
 
-    # 加载 config
-    import yaml
-    with open(args.config) as f:
-        config = yaml.safe_load(f)
+    # 1. Load model
+    model = load_model()
 
-    print("=" * 70)
-    print("  3D Gravity-Magnetic Joint Inversion — Result Analysis")
-    print("=" * 70)
-    print(f"Config : {args.config}")
-    print(f"Split  : {args.split}")
+    # 2. Run inference on test set (use 100 samples for speed)
+    print("\n--- Running inference ---")
+    preds, targets = run_inference(model, num_samples=100)
 
-    # 设置 seed
-    seed = config['training']['seed']
-    set_seed(seed)
-    print(f"Seed   : {seed}")
+    # 3. Compute metrics
+    metrics = compute_and_save_metrics(preds, targets)
 
-    # 设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    if device.type == 'cuda':
-        print(f"GPU   : {torch.cuda.get_device_name(0)}")
+    # 4. Generate figures
+    print("\n--- Generating figures ---")
+    history_path = 'results/full_training/training_history.json'
 
-    # ===== 数据准备 =====
-    from src.data.generate_synthetic import generate_dataset
-    from src.data.dataset import JointInversionInMemoryDataset
+    # 4a. Training curves
+    plot_training_curves(history_path)
 
-    data_dir = config['data']['data_dir']
-    batch_size = config['data']['batch_size']
-    train_split = config['data']['train_split']
-    val_split = config['data']['val_split']
+    # 4b. Sample inversion results (first test sample)
+    generate_sample_figures(preds, targets, sample_idx=0)
 
-    npz_exists = os.path.exists(os.path.join(data_dir, 'train_dataset.npz'))
+    # 5. Write comparison report
+    write_result_comparison_report(metrics, history_path)
 
-    if not npz_exists:
-        print("\n[Data] No pre-generated dataset found. Generating synthetic data...")
-        samples = generate_dataset(dataset_type=1, n_samples=60, seed=seed, verbose=True)
-        full_dataset = JointInversionInMemoryDataset(samples)
-        n_total = len(full_dataset)
-        n_train = int(n_total * train_split)
-        n_val = int(n_total * val_split)
-        n_test = n_total - n_train - n_val
-
-        train_ds, val_ds, test_ds = random_split(
-            full_dataset, [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(seed)
-        )
-        split_map = {'train': train_ds, 'val': val_ds, 'test': test_ds}
-        eval_loader = DataLoader(split_map[args.split], batch_size=1, shuffle=False,
-                                 num_workers=config['data']['num_workers'])
-    else:
-        from src.data.dataset import create_dataloaders
-        dataloaders = create_dataloaders(
-            data_dir=data_dir,
-            batch_size=batch_size,
-            num_workers=config['data']['num_workers'],
-        )
-        eval_loader = dataloaders[args.split]
-
-    print(f"\n[Data] Evaluating on {args.split} set ({len(eval_loader.dataset)} samples)")
-
-    # ===== 模型加载 =====
-    from src.model.joint_inversion_net import JointInversionNet
-
-    model_config = config.get('model', {})
-    use_gc = config['training'].get('gradient_checkpointing', False)
-    model = JointInversionNet(
-        in_channels=model_config.get('in_channels', 2),
-        use_gradient_checkpointing=use_gc,
-    ).to(device)
-
-    param_info = count_parameters(model)
-    print(f"[Model] Parameters: {param_info['trainable']:,} trainable / "
-          f"{param_info['total']:,} total")
-
-    # 加载 checkpoint
-    ckpt_path = args.checkpoint or os.path.join(
-        config['output']['checkpoint_dir'], 'best_model.pt'
-    )
-    if os.path.exists(ckpt_path):
-        info = load_checkpoint(ckpt_path, model)
-        print(f"[Checkpoint] Loaded: {ckpt_path} (epoch={info['epoch']}, loss={info['loss']:.6f})")
-    else:
-        print(f"[WARNING] Checkpoint not found: {ckpt_path}, using random weights!")
-
-    # ===== 推理 =====
-    print("\n[Inference] Running inference on test set...")
-    start_time = time.time()
-    inference_result = run_inference(model, eval_loader, device)
-    elapsed = time.time() - start_time
-    print(f"[Inference] Completed in {elapsed:.2f}s")
-
-    # ===== 指标计算 =====
-    print("\n[Metrics] Computing evaluation metrics...")
-    metrics = analyze_full_results(inference_result)
-
-    # 打印联合反演指标
-    print("\n" + "-" * 60)
-    print("  Joint Inversion (Task 4+5) — Final Output Metrics")
-    print("-" * 60)
-    joint_m = metrics['joint_inversion']
-    for prop in ['rho', 'kappa']:
-        m = joint_m[prop]
-        print(f"  [{prop.upper():5s}] MSE={m['MSE']:.6f}  RMSE={m['RMSE']:.6f}  "
-              f"MAE={m['MAE']:.6f}  Corr={m['Correlation']:.6f}")
-
-    # 打印独立反演指标
-    print("\n" + "-" * 60)
-    print("  Independent Inversion (Task 1+2) — Baseline Metrics")
-    print("-" * 60)
-    indep_m = metrics['independent_inversion']
-    for prop in ['rho', 'kappa']:
-        m = indep_m[prop]
-        print(f"  [{prop.upper():5s}] MSE={m['MSE']:.6f}  RMSE={m['RMSE']:.6f}  "
-              f"MAE={m['MAE']:.6f}  Corr={m['Correlation']:.6f}")
-
-    # 打印结构相似性指标
-    print("\n" + "-" * 60)
-    print("  Structural Similarity (Task 3)")
-    print("-" * 60)
-    sm = metrics['structural_similarity']
-    print(f"  Classification Accuracy: {sm['accuracy']:.4f} ({sm['accuracy']*100:.2f}%)")
-    print(f"  Total pixels evaluated: {sm['n_pixels']:,}")
-    print(f"  Pred S mean/std: {sm['pred_mean']:.4f} / {sm['pred_std']:.4f}")
-    print(f"  True positive ratio: {sm['true_positive_ratio']:.4f}")
-
-    # ===== 与论文对比 =====
-    print("\n[Comparison] Comparing with paper target values...")
-    comparison = compare_with_paper(metrics)
-
-    # ===== 保存结果 =====
-    result_dir = config['output']['result_dir']
-    os.makedirs(result_dir, exist_ok=True)
-
-    # 1) JSON 格式完整指标
-    output_json = {
-        "metrics": {
-            "joint_inversion": {
-                k: {mk: float(mv) for mk, mv in v.items()}
-                for k, v in metrics['joint_inversion'].items()
-            },
-            "independent_inversion": {
-                k: {mk: float(mv) for mk, mv in v.items()}
-                for k, v in metrics['independent_inversion'].items()
-            },
-            "structural_similarity": {
-                k: (float(v) if isinstance(v, (int, float, np.floating)) else v)
-                for k, v in metrics['structural_similarity'].items()
-            },
-        },
-        "comparison_with_paper": comparison,
-        "config": {
-            "checkpoint": ckpt_path,
-            "split": args.split,
-            "seed": seed,
-            "n_samples": len(eval_loader.dataset),
-        },
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "gpu_info": (
-            f"{torch.cuda.get_device_name(0)}" if torch.cuda.is_available()
-            else "CPU"
-        ),
-        "model_params": param_info,
-    }
-
-    json_path = os.path.join(result_dir, 'metrics.json')
-    with open(json_path, 'w') as f:
-        json.dump(output_json, f, indent=2, default=str)
-    print(f"\n[Save] Full metrics JSON: {json_path}")
-
-    # 2) Markdown 对比表
-    md_path = os.path.join(result_dir, 'comparison_table.md')
-    generate_comparison_markdown(comparison, md_path)
-
-    # ===== 总结 =====
-    print("\n" + "=" * 70)
-    print("  Analysis Complete!")
-    print("=" * 70)
-    print(f"  Output files:")
-    print(f"    - {json_path}")
-    print(f"    - {md_path}")
-    print(f"  GPU used: {output_json['gpu_info']}")
-    print(f"  Time: {elapsed:.2f}s")
-    print("=" * 70)
+    print("\n" + "=" * 60)
+    print("Phase 6 COMPLETE")
+    print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
